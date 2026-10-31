@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF Viewer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #1e1f22;
+      --menu: #2b2d31;
+      --line: #3b3d42;
+      --text: #e8e8ea;
+      --muted: #9b9da4;
+      --accent: #3d7bf0;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.3 "Segoe UI", system-ui, sans-serif;
+      user-select: none;
+    }
+
+    /* Pages */
+    #viewer {
+      position: absolute;
+      inset: 0;
+      overflow: auto;
+      scrollbar-width: none;
+      outline: none;
+    }
+    #pages {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      width: max-content;
+      min-width: 100%;
+    }
+    .page { flex: none; background: #fff; }
+    .page canvas { display: block; width: 100%; height: 100%; }
+    body.single #pages { min-height: 100%; }
+    body.single .page { margin-block: auto; }
+    body.single .page:not(.current) { display: none; }
+
+    /* Full-screen page mode */
+    body.presenting #viewer { background: #000; }
+    body.presenting.hide-cursor * { cursor: none; }
+
+    /* Page number bubble */
+    #hud {
+      position: fixed;
+      left: 50%;
+      bottom: 20px;
+      max-width: calc(100% - 32px);
+      transform: translateX(-50%);
+      padding: 6px 14px;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      border-radius: 999px;
+      background: rgb(0 0 0 / 0.7);
+      color: #fff;
+      font-size: 14px;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+    #hud.show { opacity: 1; }
+
+    /* Close button: faded in by the script as the mouse nears the corner */
+    #close-btn {
+      position: fixed;
+      top: 10px;
+      right: 10px;
+      z-index: 5;
+      display: grid;
+      place-items: center;
+      width: 26px;
+      height: 26px;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      background: rgb(30 31 34 / 0.6);
+      box-shadow: 0 0 0 1px rgb(255 255 255 / 0.18), 0 1px 4px rgb(0 0 0 / 0.25);
+      color: #fff;
+      opacity: 0;
+      visibility: hidden;
+      transition: background-color 0.12s;
+    }
+    #close-btn:hover { background: #d9363e; }
+    #close-btn svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+    body:not(.desktop) #close-btn,
+    body.hide-cursor #close-btn { display: none; }
+
+    /* Right-click menu */
+    #menu {
+      position: fixed;
+      z-index: 10;
+      min-width: 220px;
+      max-width: 300px;
+      padding: 4px;
+      background: var(--menu);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 8px 24px rgb(0 0 0 / 0.5);
+    }
+    #menu[hidden] { display: none; }
+    #menu .head { padding: 6px 10px 8px; }
+    #menu .head b {
+      display: block;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      font-weight: 600;
+    }
+    #menu .head span { color: var(--muted); font-size: 12px; }
+    #menu button {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      padding: 6px 10px;
+      border: 0;
+      border-radius: 5px;
+      background: none;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+    }
+    #menu button:hover:not(:disabled) { background: var(--accent); color: #fff; }
+    #menu button:disabled { opacity: 0.4; }
+    #menu .check { width: 12px; }
+    #menu .label { flex: 1; }
+    #menu .key { color: var(--muted); font-size: 12px; }
+    #menu button:hover .key { color: inherit; }
+    #menu hr { margin: 4px 2px; border: 0; border-top: 1px solid var(--line); }
+    #menu .foot { padding: 4px 10px 3px; color: var(--muted); font-size: 11px; }
+
+    /* Empty state and drop target */
+    #empty {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+      text-align: center;
+      color: var(--muted);
+      pointer-events: none;
+    }
+    body.has-doc #empty { display: none; }
+    #empty .big { margin: 0 0 6px; font-size: 20px; color: var(--text); }
+    #empty .keys { margin-top: 18px; line-height: 1.9; }
+    body:not(.desktop) .desktop-only { display: none; }
+    kbd {
+      padding: 2px 5px;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      background: var(--menu);
+      color: var(--text);
+      font: 12px/1 "Segoe UI", system-ui, sans-serif;
+    }
+    #drop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      place-items: center;
+      font-size: 20px;
+      background: rgb(61 123 240 / 0.15);
+      border: 3px dashed var(--accent);
+      pointer-events: none;
+    }
+    #drop.show { display: grid; }
+  </style>
+</head>
+<body>
+  <main id="viewer" tabindex="-1">
+    <div id="pages"></div>
+  </main>
+
+  <div id="empty">
+    <div>
+      <p class="big">Drop a PDF here</p>
+      <p>or right-click › Open…</p>
+      <p class="keys">
+        <kbd>←</kbd> <kbd>→</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd> change page<br />
+        <kbd>F</kbd> or double-click: full screen<br />
+        <span class="desktop-only">Drag anywhere to move the window</span>
+      </p>
+    </div>
+  </div>
+
+  <div id="hud"></div>
+  <button id="close-btn" title="Close (Ctrl+W)" aria-label="Close">
+    <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" /></svg>
+  </button>
+  <div id="menu" hidden></div>
+  <div id="drop">Drop to open</div>
+  <input id="file-input" type="file" accept="application/pdf,.pdf" hidden />
+
+  <script type="module">
+    // The app's own copy, the project's node_modules when served over http, the CDN when opened as a plain file.
+    const PDFJS_SOURCES = ["./pdfjs/", "./node_modules/pdfjs-dist/", "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/"];
+    const GAP = 8; // gap between pages in continuous mode
+    const MAX_CANVAS_PIXELS = 32 * 1024 * 1024;
+
+    const $ = (id) => document.getElementById(id);
+    const viewer = $("viewer");
+    const pagesEl = $("pages");
+    const fileInput = $("file-input");
+    const hud = $("hud");
+    const menu = $("menu");
+    const desktop = window.chrome?.webview ? createDesktop(window.chrome.webview) : null;
+
+    const prefs = loadPrefs();
+    let pdfjs = null;
+    let doc = null;
+    let docName = "";
+    let pages = []; // { page, w, h, el, scale, key, task }
+    let current = 0;
+    let presenting = false;
+    let alwaysOnTop = false;
+    let appVersion = ""; // the desktop app's version, shown at the bottom of the menu
+    let loadId = 0;
+
+    // Full-screen page mode always shows one whole page at a time.
+    const view = () => (presenting ? { fit: "page", mode: "single" } : prefs);
+
+    // Desktop app: PDF Viewer.exe shows this page in WebView2 and handles the window.
+    // Messages to it are "command" or "command:argument"; messages back are { type, … }.
+    function createDesktop(webview) {
+      const send = (msg) => webview.postMessage(msg);
+      const handlers = {};
+      webview.addEventListener("message", (e) => handlers[e.data?.type]?.(e.data));
+      return {
+        drag: () => send("drag"),
+        resize: (edge) => send(`resize:${edge}`),
+        fitToAspect: (aspect) => send(`fit:${aspect}`),
+        setFullScreen: (on) => send(`fullscreen:${on ? 1 : 0}`),
+        toggleAlwaysOnTop: () => send("topmost"),
+        minimize: () => send("minimize"),
+        close: () => send("close"),
+        on: (type, handler) => (handlers[type] = handler),
+      };
+    }
+
+    function loadPrefs() {
+      const defaults = { fit: "width", mode: "continuous" };
+      try {
+        return { ...defaults, ...JSON.parse(localStorage.getItem("pdf-viewer-prefs")) };
+      } catch {
+        return defaults;
+      }
+    }
+
+    function savePrefs() {
+      try {
+        localStorage.setItem("pdf-viewer-prefs", JSON.stringify(prefs));
+      } catch {}
+    }
+
+    function getPdfjs() {
+      pdfjs ??= (async () => {
+        for (const source of PDFJS_SOURCES) {
+          const base = new URL(source, location.href).href;
+          try {
+            const lib = await import(`${base}build/pdf.min.mjs`);
+            lib.GlobalWorkerOptions.workerSrc = `${base}build/pdf.worker.min.mjs`;
+            return { lib, base };
+          } catch {}
+        }
+        throw new Error("pdf.js is unavailable");
+      })().catch((e) => {
+        pdfjs = null;
+        throw e;
+      });
+      return pdfjs;
+    }
+
+    // ---- Loading ----
+
+    async function openFile(file) {
+      if (!file) return;
+      const id = ++loadId;
+      showHud(`Loading ${file.name}…`, 60000);
+      let lib, newDoc, proxies;
+      let cancelled = false;
+      try {
+        const pdf = await getPdfjs();
+        lib = pdf.lib;
+        const task = lib.getDocument({
+          data: new Uint8Array(await file.arrayBuffer()),
+          cMapUrl: `${pdf.base}cmaps/`,
+          cMapPacked: true,
+          standardFontDataUrl: `${pdf.base}standard_fonts/`,
+        });
+        task.onPassword = (update, reason) => {
+          const pw = prompt(
+            reason === lib.PasswordResponses.INCORRECT_PASSWORD
+              ? "Wrong password, try again:"
+              : `"${file.name}" is password protected:`
+          );
+          if (pw == null) {
+            cancelled = true;
+            task.destroy();
+          } else update(pw);
+        };
+        newDoc = await task.promise;
+        proxies = await Promise.all(
+          Array.from({ length: newDoc.numPages }, (_, i) => newDoc.getPage(i + 1))
+        );
+      } catch (e) {
+        if (id !== loadId) return;
+        hideHud();
+        if (cancelled) return;
+        alert(
+          lib
+            ? `Couldn't open "${file.name}":\n${e?.message ?? e}`
+            : "Couldn't load the PDF renderer (pdf.js). It needs an internet connection the first time."
+        );
+        return;
+      }
+      if (id !== loadId) return newDoc.destroy();
+
+      resetRendering();
+      doc?.destroy();
+      doc = newDoc;
+      docName = file.name;
+      pages = proxies.map((page) => {
+        const { width, height } = page.getViewport({ scale: 1 });
+        const el = document.createElement("div");
+        el.className = "page";
+        return { page, w: width, h: height, el, scale: 1, drawn: null };
+      });
+      pagesEl.replaceChildren(...pages.map((p) => p.el));
+      current = 0;
+
+      document.title = `${file.name} – PDF Viewer`;
+      document.body.classList.add("has-doc");
+      layout();
+      goTo(0);
+      showHud(`${file.name} · ${pages.length} page${pages.length > 1 ? "s" : ""}`, 2000);
+      viewer.focus({ preventScroll: true });
+    }
+
+    // ---- Layout and rendering ----
+
+    function layout() {
+      if (!doc) return;
+      const { fit, mode } = view();
+      const availW = viewer.clientWidth;
+      const availH = viewer.clientHeight;
+      for (const p of pages) {
+        const s = fit === "page" ? Math.min(availW / p.w, availH / p.h) : availW / p.w;
+        p.scale = Math.max(s, 0.05);
+        p.el.style.width = `${Math.floor(p.w * p.scale)}px`;
+        p.el.style.height = `${Math.floor(p.h * p.scale)}px`;
+      }
+      document.body.classList.toggle("single", mode === "single");
+    }
+
+    // Re-fit the pages while keeping the same spot of the current page in view.
+    function relayout() {
+      if (!doc) return;
+      if (view().mode === "continuous") {
+        const el = pages[current].el;
+        const anchor = viewer.clientHeight / 3;
+        const frac = (viewer.scrollTop + anchor - el.offsetTop) / el.offsetHeight;
+        layout();
+        scrollToY(el.offsetTop + frac * el.offsetHeight - anchor);
+      } else {
+        layout();
+      }
+      update();
+    }
+
+    // ---- Rendering ----
+    //
+    // A page change never waits for pdf.js: pages are drawn from caches.
+    //  - Every page gets a small thumbnail early on, so even the wildest flipping shows the page.
+    //  - Full-resolution renders follow for the current page, once flipping pauses, and for the next
+    //    pages in the direction of travel, so paging at a normal pace lands on pages already sharp.
+    // One pdf.js render runs at a time; a full render nobody is waiting for any more is cancelled.
+
+    const THUMB_SIZE = 384; // long side of a thumbnail, px
+    const THUMB_MAX = 500; // thumbnails kept (about 0.4 MB each)
+    const THUMBS_AHEAD = 40; // thumbnails made first, in the direction of travel
+    const FULL_AHEAD = 3; // pages rendered ahead at full resolution
+    const FULL_BEHIND = 1;
+    const SETTLE_MS = 30; // no full renders while pages change faster than this
+
+    const thumbs = new Map(); // page index -> canvas
+    const fulls = new Map(); // page index -> { canvas, key }
+    const shown = new Set(); // pages that have a display canvas
+    const failed = new Set(); // pages pdf.js couldn't render: not retried
+    const canvasPool = [];
+    let job = null; // the render in progress
+    let travel = 1; // direction of the last page change
+    let lastFlip = 0;
+    let settleTimer;
+
+    // The page's size on screen, in device pixels.
+    function deviceSize(p) {
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.floor(p.w * p.scale) * dpr;
+      const h = Math.floor(p.h * p.scale) * dpr;
+      const k = Math.min(1, Math.sqrt(MAX_CANVAS_PIXELS / (w * h)));
+      return { w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) };
+    }
+    const sizeKey = (s) => `${s.w}x${s.h}`;
+    const inRange = (i) => i >= 0 && i < pages.length;
+    const settled = () => performance.now() - lastFlip >= SETTLE_MS;
+    const needsFull = (i) => !failed.has(i) && fulls.get(i)?.key !== sizeKey(deviceSize(pages[i]));
+    const needsThumb = (i) => !failed.has(i) && !thumbs.has(i);
+
+    function visiblePages() {
+      if (view().mode === "single") return [current];
+      const top = viewer.scrollTop - viewer.clientHeight / 2;
+      const bottom = viewer.scrollTop + viewer.clientHeight * 1.5;
+      const list = [current];
+      for (let i = current - 1; i >= 0 && pages[i].el.offsetTop + pages[i].el.offsetHeight > top; i--) list.push(i);
+      for (let i = current + 1; i < pages.length && pages[i].el.offsetTop < bottom; i++) list.push(i);
+      return list;
+    }
+
+    // Show the best cached image of each visible page, let go of the rest, and keep pdf.js busy.
+    function update() {
+      if (!doc) return;
+      const visible = visiblePages();
+      for (const i of shown) if (!visible.includes(i)) hide(i);
+      for (const i of visible) paint(i);
+      evict(visible);
+      pump();
+    }
+
+    function paint(i) {
+      const p = pages[i];
+      const size = deviceSize(p);
+      const full = fulls.get(i);
+      const source = full?.canvas ?? thumbs.get(i);
+      let c = p.el.firstChild;
+      if (!c) {
+        c = canvasPool.pop() ?? document.createElement("canvas");
+        c.getContext("2d").clearRect(0, 0, c.width, c.height); // may still hold another page
+        p.el.append(c);
+        shown.add(i);
+        p.drawn = null;
+      }
+      if (c.width !== size.w || c.height !== size.h) {
+        c.width = size.w;
+        c.height = size.h;
+        p.drawn = null;
+      }
+      if (!source || p.drawn === source) return;
+      c.getContext("2d").drawImage(source, 0, 0, size.w, size.h);
+      p.drawn = source;
+      p.el.dataset.quality = !full ? "thumb" : full.key === sizeKey(size) ? "full" : "resized";
+    }
+
+    function hide(i) {
+      const p = pages[i];
+      const c = p.el.firstChild;
+      if (c) {
+        c.remove();
+        if (canvasPool.length < 4) canvasPool.push(c);
+        else c.width = c.height = 0;
+      }
+      shown.delete(i);
+      p.drawn = null;
+      delete p.el.dataset.quality;
+    }
+
+    function evict(visible) {
+      for (const [i, f] of fulls) {
+        if (Math.abs(i - current) > FULL_AHEAD + 1 && !visible.includes(i)) {
+          f.canvas.width = f.canvas.height = 0;
+          fulls.delete(i);
+        }
+      }
+      if (thumbs.size > THUMB_MAX) {
+        const far = [...thumbs.keys()].sort((a, b) => Math.abs(b - current) - Math.abs(a - current));
+        for (const i of far.slice(0, thumbs.size - THUMB_MAX)) {
+          thumbs.get(i).width = 0;
+          thumbs.delete(i);
+        }
+      }
+    }
+
+    function nextJob() {
+      const calm = settled();
+      if (calm && needsFull(current)) return { i: current, full: true };
+      for (let k = 0; k <= THUMBS_AHEAD; k++) {
+        const i = current + travel * k;
+        if (inRange(i) && needsThumb(i)) return { i, full: false };
+      }
+      if (calm) {
+        for (const i of visiblePages()) if (needsFull(i)) return { i, full: true };
+        for (let k = 1; k <= FULL_AHEAD; k++) {
+          const i = current + travel * k;
+          if (inRange(i) && needsFull(i)) return { i, full: true };
+        }
+        for (let k = 1; k <= FULL_BEHIND; k++) {
+          const i = current - travel * k;
+          if (inRange(i) && needsFull(i)) return { i, full: true };
+        }
+      }
+      if (thumbs.size < THUMB_MAX) {
+        for (let k = 1; k < pages.length; k++) {
+          for (const i of [current - travel * k, current + travel * k]) {
+            if (inRange(i) && needsThumb(i)) return { i, full: false };
+          }
+        }
+      }
+      return null;
+    }
+
+    // Still worth finishing? While pages flip, only the page on screen is.
+    function stillWanted(j) {
+      if (!j.full) return true; // thumbnails are quick and always useful
+      if (!settled()) return j.i === current;
+      if (j.i !== current && needsFull(current)) return false; // the page on screen comes first
+      return Math.abs(j.i - current) <= FULL_AHEAD || visiblePages().includes(j.i);
+    }
+
+    function pump() {
+      if (!doc) return;
+      if (job) {
+        if (!job.cancelled && !stillWanted(job)) {
+          job.cancelled = true;
+          job.task.cancel();
+        }
+        return; // the job's end calls pump() again
+      }
+      const next = nextJob();
+      if (next) run(next);
+    }
+
+    async function run(j) {
+      const owner = doc;
+      const p = pages[j.i];
+      const size = j.full ? deviceSize(p) : null;
+      const scale = j.full ? size.w / p.w : THUMB_SIZE / Math.max(p.w, p.h);
+      const viewport = p.page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = j.full ? size.w : Math.max(1, Math.round(viewport.width));
+      canvas.height = j.full ? size.h : Math.max(1, Math.round(viewport.height));
+      job = j;
+      j.task = p.page.render({ canvasContext: canvas.getContext("2d"), viewport });
+      try {
+        await j.task.promise;
+        if (owner !== doc) return;
+        if (j.full) {
+          const old = fulls.get(j.i);
+          if (old) old.canvas.width = old.canvas.height = 0;
+          fulls.set(j.i, { canvas, key: sizeKey(size) });
+        } else {
+          thumbs.set(j.i, canvas);
+        }
+        if (shown.has(j.i)) paint(j.i);
+      } catch (e) {
+        canvas.width = canvas.height = 0;
+        if (e?.name !== "RenderingCancelledException" && owner === doc) {
+          console.error(e);
+          failed.add(j.i);
+        }
+      } finally {
+        if (job === j) job = null;
+        if (owner === doc) pump();
+      }
+    }
+
+    function resetRendering() {
+      if (job) {
+        job.cancelled = true;
+        job.task.cancel();
+        job = null;
+      }
+      for (const c of [...thumbs.values(), ...[...fulls.values()].map((f) => f.canvas), ...canvasPool]) {
+        c.width = c.height = 0;
+      }
+      thumbs.clear();
+      fulls.clear();
+      shown.clear();
+      failed.clear();
+      canvasPool.length = 0;
+      lastFlip = 0;
+    }
+
+    // ---- Navigation ----
+
+    function setCurrent(i) {
+      if (i === current && pages[i].el.classList.contains("current")) return;
+      // A real page change (not the first page of a new document) delays full renders a moment.
+      if (pages[current]?.el.classList.contains("current")) {
+        travel = i > current ? 1 : -1;
+        lastFlip = performance.now();
+        clearTimeout(settleTimer);
+        settleTimer = setTimeout(pump, SETTLE_MS);
+      }
+      pages[current]?.el.classList.remove("current");
+      current = i;
+      pages[i].el.classList.add("current");
+      showHud(`${i + 1} / ${pages.length}`);
+    }
+
+    function goTo(i, fromBottom = false) {
+      if (!doc) return;
+      i = Math.max(0, Math.min(pages.length - 1, i));
+      setCurrent(i);
+      if (view().mode === "single") scrollToY(fromBottom ? Infinity : 0);
+      else scrollToY(pages[i].el.offsetTop);
+      update();
+    }
+
+    // Every step reaches the screen: steps arriving faster than frames queue up, one page per frame.
+    let queuedSteps = 0;
+    let stepping = false;
+    function step(dir, fromBottom = false, inFrame = false) {
+      if (stepping && !inFrame) {
+        queuedSteps += dir;
+        return;
+      }
+      const i = current + dir;
+      if (!inRange(i)) {
+        queuedSteps = 0;
+        stepping = false;
+        return;
+      }
+      goTo(i, fromBottom);
+      stepping = true;
+      const next = () => {
+        if (!queuedSteps) return void (stepping = false);
+        const d = Math.sign(queuedSteps);
+        queuedSteps -= d;
+        step(d, fromBottom, true);
+      };
+      // From an event the page is painted at the end of this frame; from a frame, at the end of it.
+      if (inFrame) requestAnimationFrame(next);
+      else requestAnimationFrame(() => requestAnimationFrame(next));
+    }
+
+    function jumpTo(i) {
+      queuedSteps = 0;
+      goTo(i);
+    }
+
+    // True when the viewer can't scroll any further in that direction.
+    function atEnd(dir) {
+      return dir > 0
+        ? viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 1
+        : viewer.scrollTop <= 0;
+    }
+
+    // In continuous mode the current page is the one crossing the top third of the view.
+    function pageAtScroll() {
+      if (viewer.scrollTop > 0 && atEnd(1)) return pages.length - 1;
+      const line = viewer.scrollTop + viewer.clientHeight / 3;
+      let lo = 0, hi = pages.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi + 1) >> 1;
+        if (pages[mid].el.offsetTop <= line) lo = mid;
+        else hi = mid - 1;
+      }
+      return lo;
+    }
+
+    let scrollQueued = false;
+    let ignoreScroll = false; // skip the scroll event caused by our own jump
+
+    function scrollToY(y) {
+      y = Math.max(0, Math.min(viewer.scrollHeight - viewer.clientHeight, y));
+      if (Math.abs(viewer.scrollTop - y) < 1) return; // no scroll event would fire
+      ignoreScroll = true;
+      viewer.scrollTop = y;
+    }
+
+    viewer.addEventListener("scroll", () => {
+      if (scrollQueued) return;
+      scrollQueued = true;
+      requestAnimationFrame(() => {
+        scrollQueued = false;
+        if (!doc) return;
+        if (ignoreScroll) ignoreScroll = false;
+        else if (view().mode === "continuous") setCurrent(pageAtScroll());
+        update();
+      });
+    });
+
+    new ResizeObserver(relayout).observe(viewer);
+
+    // ---- Modes ----
+
+    function setFit(fit) {
+      prefs.fit = fit;
+      savePrefs();
+      if (!presenting) relayout();
+    }
+
+    function setMode(mode) {
+      prefs.mode = mode;
+      savePrefs();
+      if (doc && !presenting) {
+        layout();
+        goTo(current);
+      }
+    }
+
+    function setPresenting(on) {
+      if (on === presenting) return;
+      presenting = on;
+      document.body.classList.toggle("presenting", on);
+      showCursor();
+      if (!doc) return;
+      layout();
+      goTo(current);
+    }
+
+    function toggleFullscreen() {
+      if (!doc) return;
+      if (presenting) return exitFullscreen();
+      setPresenting(true);
+      if (desktop) desktop.setFullScreen(true);
+      // If full screen is refused, page mode still fills the window.
+      else document.documentElement.requestFullscreen?.().catch(() => {});
+    }
+
+    function exitFullscreen() {
+      if (document.fullscreenElement) return document.exitFullscreen().catch(() => {}); // fullscreenchange ends page mode
+      setPresenting(false);
+      desktop?.setFullScreen(false);
+    }
+
+    document.addEventListener("fullscreenchange", () => setPresenting(!!document.fullscreenElement));
+
+    let announceOnTop = false;
+    function toggleAlwaysOnTop() {
+      announceOnTop = true; // the new state arrives as a "state" message
+      desktop.toggleAlwaysOnTop();
+    }
+
+    function fitWindowToPage() {
+      if (doc && !presenting) desktop.fitToAspect(pages[current].w / pages[current].h);
+    }
+
+    let hudTimer;
+    function showHud(text, ms = 1200) {
+      hud.textContent = text;
+      hud.classList.add("show");
+      clearTimeout(hudTimer);
+      hudTimer = setTimeout(hideHud, ms);
+    }
+
+    function hideHud() {
+      clearTimeout(hudTimer);
+      hud.classList.remove("show");
+    }
+
+    let cursorTimer;
+    function showCursor() {
+      document.body.classList.remove("hide-cursor");
+      clearTimeout(cursorTimer);
+      if (presenting) cursorTimer = setTimeout(() => document.body.classList.add("hide-cursor"), 1500);
+    }
+    document.addEventListener("mousemove", showCursor);
+
+    // ---- Right-click menu ----
+
+    function openMenu(x, y) {
+      const items = [
+        { label: "Open…", key: "Ctrl+O", run: () => fileInput.click() },
+        "-",
+        // A toggle's key is shown on the choice it switches to.
+        { label: "Fit width", key: prefs.fit === "page" ? "Z" : "", checked: prefs.fit === "width", run: () => setFit("width") },
+        { label: "Fit page", key: prefs.fit === "width" ? "Z" : "", checked: prefs.fit === "page", run: () => setFit("page") },
+        "-",
+        { label: "Single page", key: prefs.mode === "continuous" ? "C" : "", checked: prefs.mode === "single", run: () => setMode("single") },
+        { label: "Continuous", key: prefs.mode === "single" ? "C" : "", checked: prefs.mode === "continuous", run: () => setMode("continuous") },
+        "-",
+        { label: presenting ? "Exit full screen" : "Full screen", key: "F", disabled: !doc, run: toggleFullscreen },
+        desktop && { label: "Fit window to page", disabled: !doc || presenting, run: fitWindowToPage },
+        desktop && { label: "Always on top", key: "T", checked: alwaysOnTop, run: toggleAlwaysOnTop },
+        desktop && "-",
+        desktop && { label: "Minimize", run: desktop.minimize },
+        desktop && { label: "Close", key: "Ctrl+W", run: desktop.close },
+      ];
+
+      menu.replaceChildren();
+      if (doc) {
+        const head = document.createElement("div");
+        head.className = "head";
+        head.append(document.createElement("b"), document.createElement("span"));
+        head.firstChild.textContent = docName;
+        head.lastChild.textContent = `Page ${current + 1} of ${pages.length}`;
+        menu.append(head, document.createElement("hr"));
+      }
+      for (const item of items) {
+        if (!item) continue;
+        if (item === "-") {
+          menu.append(document.createElement("hr"));
+          continue;
+        }
+        const b = document.createElement("button");
+        b.disabled = !!item.disabled;
+        for (const [cls, text] of [["check", item.checked ? "✓" : ""], ["label", item.label], ["key", item.key ?? ""]]) {
+          const span = document.createElement("span");
+          span.className = cls;
+          span.textContent = text;
+          b.append(span);
+        }
+        b.addEventListener("click", () => {
+          closeMenu();
+          item.run();
+        });
+        menu.append(b);
+      }
+      if (appVersion) {
+        const foot = document.createElement("div");
+        foot.className = "foot";
+        foot.textContent = `PDF Viewer ${appVersion}`;
+        menu.append(document.createElement("hr"), foot);
+      }
+
+      menu.hidden = false;
+      const r = menu.getBoundingClientRect();
+      menu.style.left = `${Math.max(4, Math.min(x, innerWidth - r.width - 4))}px`;
+      menu.style.top = `${Math.max(4, Math.min(y, innerHeight - r.height - 4))}px`;
+    }
+
+    function closeMenu() {
+      menu.hidden = true;
+    }
+
+    document.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      openMenu(e.clientX, e.clientY);
+    });
+
+    document.addEventListener(
+      "pointerdown",
+      (e) => {
+        if (!menu.hidden && !menu.contains(e.target)) closeMenu();
+      },
+      true
+    );
+    addEventListener("blur", closeMenu);
+    addEventListener("resize", closeMenu);
+
+    // ---- Input ----
+
+    // Typing a page number then Enter jumps to it.
+    let typed = "";
+    let typedTimer;
+    function typeDigit(digits) {
+      typed = digits.slice(0, 5);
+      clearTimeout(typedTimer);
+      if (!typed) return hideHud();
+      showHud(`Go to page ${typed}`, 3000);
+      typedTimer = setTimeout(() => (typed = ""), 3000);
+    }
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        if (!menu.hidden) closeMenu();
+        else if (typed) typeDigit("");
+        // In browser full screen the browser leaves it on Esc by itself.
+        else if (presenting && !document.fullscreenElement) exitFullscreen();
+        return;
+      }
+      closeMenu();
+      if (e.altKey) return;
+      if (e.ctrlKey || e.metaKey) {
+        const k = e.key.toLowerCase();
+        if (k === "o") {
+          e.preventDefault();
+          fileInput.click();
+        } else if (k === "p") {
+          e.preventDefault(); // full screen, as in Acrobat Reader, rather than print
+          toggleFullscreen();
+        } else if (k === "w" && desktop) {
+          e.preventDefault();
+          desktop.close();
+        }
+        return;
+      }
+
+      const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+      if (key === "z") return setFit(prefs.fit === "width" ? "page" : "width");
+      if (key === "c") return setMode(prefs.mode === "single" ? "continuous" : "single");
+      if (key === "t" && desktop) return toggleAlwaysOnTop();
+      if (!doc) return;
+      if (key === "f") return toggleFullscreen();
+      if (/^[0-9]$/.test(key)) return typeDigit(typed + key);
+      if (key === "Backspace" && typed) return typeDigit(typed.slice(0, -1));
+      if (key === "Enter" && typed) {
+        jumpTo(Number(typed) - 1);
+        return typeDigit("");
+      }
+
+      let dir = 0;
+      let fromBottom = false;
+      switch (key) {
+        case "ArrowRight":
+        case "PageDown":
+          dir = 1;
+          break;
+        case "ArrowLeft":
+        case "PageUp":
+          dir = -1;
+          break;
+        case "Home":
+        case "End":
+          e.preventDefault();
+          return jumpTo(key === "Home" ? 0 : pages.length - 1);
+        case "ArrowDown":
+        case "ArrowUp":
+        case " ": {
+          // Scroll; in single-page mode flip the page once it can't scroll further.
+          const d = key === "ArrowUp" || (key === " " && e.shiftKey) ? -1 : 1;
+          if (view().mode === "single" && atEnd(d)) {
+            dir = d;
+            fromBottom = d < 0;
+            break;
+          }
+          e.preventDefault();
+          viewer.scrollBy(0, d * (key === " " ? viewer.clientHeight * 0.85 : 60));
+          return;
+        }
+      }
+      if (!dir) return;
+      e.preventDefault();
+      step(dir, fromBottom);
+    });
+
+    // Single page: once the page can't scroll further, the wheel turns one page per notch,
+    // however fast it spins (see step()). Touchpads add their small movements up to a notch.
+    let notch = 100; // px per wheel notch; the desktop app reports Windows' setting
+    let wheelRest = 0;
+    viewer.addEventListener(
+      "wheel",
+      (e) => {
+        closeMenu();
+        if (!doc || e.ctrlKey || view().mode !== "single") return;
+        const delta = e.deltaMode ? e.deltaY * (100 / 3) : e.deltaY;
+        const dir = Math.sign(delta);
+        if (!dir || !atEnd(dir)) {
+          wheelRest = 0;
+          return;
+        }
+        e.preventDefault();
+        let notches;
+        if (Math.abs(delta) >= notch / 2) {
+          notches = Math.max(1, Math.round(Math.abs(delta) / notch)); // several when the browser merged events
+          wheelRest = 0;
+        } else {
+          wheelRest += delta;
+          notches = Math.floor(Math.abs(wheelRest) / notch);
+          wheelRest -= Math.sign(wheelRest) * notches * notch;
+        }
+        for (let n = 0; n < notches; n++) step(dir, dir < 0);
+      },
+      { passive: false }
+    );
+
+    // Double-click: full screen, and back.
+    viewer.addEventListener("dblclick", () => toggleFullscreen());
+
+    // Desktop app: drag anywhere with the left button to move the window, drag its edges to resize it.
+    // The move starts once the mouse has moved a little, so clicks and double-clicks still reach the page.
+    const DRAG_START = 4; // px
+    const EDGE = 6;
+    const EDGE_CURSORS = {
+      left: "ew-resize", right: "ew-resize", top: "ns-resize", bottom: "ns-resize",
+      topleft: "nwse-resize", bottomright: "nwse-resize", topright: "nesw-resize", bottomleft: "nesw-resize",
+    };
+    function edgeAt(x, y) {
+      if (presenting) return "";
+      const v = y < EDGE ? "top" : y >= innerHeight - EDGE ? "bottom" : "";
+      const h = x < EDGE ? "left" : x >= innerWidth - EDGE ? "right" : "";
+      return v + h;
+    }
+    let press = null; // where the left button went down, until the move starts
+    viewer.addEventListener("pointermove", (e) => {
+      if (!desktop) return;
+      if (!e.buttons) {
+        press = null;
+        viewer.style.cursor = EDGE_CURSORS[edgeAt(e.clientX, e.clientY)] ?? "";
+      } else if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) >= DRAG_START) {
+        press = null;
+        desktop.drag(); // Windows' own move loop takes the mouse from here
+      }
+    });
+    viewer.addEventListener("pointerdown", (e) => {
+      press = null;
+      if (!desktop || e.button !== 0 || presenting) return;
+      const edge = edgeAt(e.clientX, e.clientY);
+      if (edge) desktop.resize(edge);
+      else press = { x: e.clientX, y: e.clientY };
+    });
+
+    // Desktop app: a close button that fades in as the mouse nears the top-right corner,
+    // from a tenth of the screen's longest side away.
+    const closeBtn = $("close-btn");
+    function fadeClose(x, y) {
+      const reach = Math.max(screen.width, screen.height) / 10;
+      const distance = Math.hypot(innerWidth - x, y);
+      const opacity = Math.min(1, Math.max(0, (reach - distance) / (reach * 0.75)));
+      closeBtn.style.opacity = opacity;
+      closeBtn.style.visibility = opacity > 0.02 ? "visible" : "hidden";
+    }
+    if (desktop) {
+      closeBtn.addEventListener("click", () => desktop.close());
+      document.addEventListener("pointermove", (e) => fadeClose(e.clientX, e.clientY));
+      document.addEventListener("mouseout", (e) => {
+        if (!e.relatedTarget) fadeClose(-1e4, 1e4); // left the window
+      });
+    }
+
+    // Keep keyboard focus on the pages when clicking menu items.
+    document.addEventListener("mousedown", (e) => {
+      if (e.target.closest("button")) e.preventDefault();
+    });
+
+    fileInput.addEventListener("change", () => {
+      openFile(fileInput.files[0]);
+      fileInput.value = "";
+    });
+
+    // Drag and drop anywhere in the window.
+    const drop = $("drop");
+    let dragDepth = 0;
+    const hasFiles = (e) => e.dataTransfer?.types.includes("Files");
+    addEventListener("dragenter", (e) => {
+      if (!hasFiles(e)) return;
+      dragDepth++;
+      drop.classList.add("show");
+    });
+    addEventListener("dragleave", (e) => {
+      if (!hasFiles(e)) return;
+      if (--dragDepth <= 0) {
+        dragDepth = 0;
+        drop.classList.remove("show");
+      }
+    });
+    addEventListener("dragover", (e) => e.preventDefault());
+    addEventListener("drop", (e) => {
+      e.preventDefault();
+      dragDepth = 0;
+      drop.classList.remove("show");
+      const file = [...(e.dataTransfer?.files ?? [])].find(
+        (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name)
+      );
+      openFile(file);
+    });
+
+    if (desktop) {
+      document.body.classList.add("desktop");
+      desktop.on("state", (state) => {
+        alwaysOnTop = state.alwaysOnTop;
+        appVersion = state.version;
+        if (state.wheelLines > 0) notch = (state.wheelLines * 100) / 3;
+        if (announceOnTop) showHud(alwaysOnTop ? "Always on top" : "Not on top");
+        announceOnTop = false;
+      });
+      desktop.on("left-full-screen", () => setPresenting(false));
+      // A PDF passed on the command line ("Open with…"), served by the app at https://file.local/.
+      desktop.on("open-file", async ({ name }) => {
+        const response = await fetch(`https://file.local/${encodeURIComponent(name)}`);
+        if (response.ok) openFile(new File([await response.blob()], name, { type: "application/pdf" }));
+      });
+    }
+    viewer.focus({ preventScroll: true });
+    getPdfjs().catch(() => {}); // warm up while the user picks a file
+  </script>
+</body>
+</html>

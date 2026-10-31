@@ -1,0 +1,15 @@
+{
+  "name": "pdf-viewer",
+  "productName": "PDF Viewer",
+  "version": "2.2.0",
+  "private": true,
+  "description": "Borderless, minimal PDF viewer",
+  "author": "Benn25",
+  "scripts": {
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File build/build.ps1",
+    "deploy": "powershell -NoProfile -ExecutionPolicy Bypass -File build/build.ps1 -InstallTo \"C:\\no install progs\\PDF Viewer\""
+  },
+  "dependencies": {
+    "pdfjs-dist": "4.10.38"
+  }
+}

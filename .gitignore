@@ -1,0 +1,7 @@
+node_modules/
+dist/
+build/webview2/
+build/obj/
+
+# Test documents stay local
+*.pdf

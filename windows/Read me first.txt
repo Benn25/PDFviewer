@@ -1,0 +1,58 @@
+PDF Viewer
+==========
+
+A small, borderless PDF viewer for Windows 10 and 11.
+No ads, no account, no installer: this folder is the whole app.
+
+
+Setting it up
+-------------
+1. Put this folder somewhere it can stay, for example
+   C:\Users\<you>\Programs\PDF Viewer (any folder of your own works).
+2. Double-click "Add to Windows.cmd". It adds:
+     - a Start Menu entry,
+     - "PDF Viewer" to the "Open with" list of PDF files,
+     - "Open with PDF Viewer" to the right-click menu of PDF files.
+   It only touches your own user account: no administrator rights needed.
+3. To open every PDF with it on double-click:
+   right-click a PDF > Open with > Choose another app > PDF Viewer > Always.
+
+The first time, Windows may say "Windows protected your PC" because the app
+isn't from a known publisher: click "More info", then "Run anyway".
+
+
+Using it
+--------
+There are no toolbars: everything is in the right-click menu.
+
+  Drag anywhere ............. move the window (drag its edges to resize)
+  Right-click ............... menu: Open, Fit width / Fit page,
+                              Single page / Continuous, Full screen,
+                              Fit window to page, Always on top
+  Top-right corner .......... a small X fades in as the mouse gets close: close
+  Left / Right, PgUp / PgDn . previous / next page
+  Up / Down, Space, wheel ... scroll, and turn pages one by one
+  Home / End ................ first / last page
+  A number, then Enter ...... go to that page
+  F, Ctrl+P or double-click . full-screen page mode, and back (Esc leaves too)
+  Z ......................... fit width <-> fit page
+  C ......................... continuous <-> single page
+  T ......................... always on top, on / off
+  Ctrl+O .................... open a PDF (or drop one on the window)
+  Ctrl+W .................... close
+
+
+Updating
+--------
+Close the viewer, then unzip the new version over this folder, replacing the
+files. As long as the folder stays in the same place, that's all.
+
+
+Removing
+--------
+Double-click "Remove from Windows.cmd", then delete the folder.
+
+
+Needs Windows 10 or 11, 64-bit. The viewer runs on the Microsoft Edge WebView2
+Runtime, which Windows 11 includes. On Windows 10 it normally arrives with Edge
+updates; otherwise get it from https://developer.microsoft.com/microsoft-edge/webview2/
