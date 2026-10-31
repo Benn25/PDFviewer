@@ -47,6 +47,8 @@ static class Program {
   // Kept apart from Main so the WebView2 types load only once AssemblyResolve is in place.
   [MethodImpl(MethodImplOptions.NoInlining)]
   static void Run(string[] args) {
+    // The browser engine takes the longest to start, so it starts first, while the window is made.
+    Task<CoreWebView2Environment> engine = StartEngine();
     string file = null;
     foreach (string arg in args) {
       if (arg.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase) && File.Exists(arg)) {
@@ -54,7 +56,14 @@ static class Program {
         break;
       }
     }
-    Application.Run(new ViewerForm(file));
+    Application.Run(new ViewerForm(file, engine));
+  }
+
+  static async Task<CoreWebView2Environment> StartEngine() {
+    CoreWebView2Environment.SetLoaderDllFolderPath(AppDir);
+    CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions();
+    options.EnableTrackingPrevention = false; // only the app's own page is ever shown: nothing to track
+    return await CoreWebView2Environment.CreateAsync(null, Path.Combine(DataDir, "WebView2"), options);
   }
 }
 
@@ -82,15 +91,16 @@ static class Settings {
 
 class ViewerForm : Form {
   readonly WebView2 web = new WebView2();
+  readonly Task<CoreWebView2Environment> engine;
   readonly string startFile;
-  string servedFile;          // the PDF the page fetches from https://file.local/
   bool onTop;                 // always on top (not Form.TopMost: setting that activates the window)
   bool fullScreen;
   bool wasMaximized;
   Rectangle restoreBounds;    // where to go back to after full screen
 
-  public ViewerForm(string file) {
+  public ViewerForm(string file, Task<CoreWebView2Environment> engine) {
     startFile = file;
+    this.engine = engine;
     Text = "PDF Viewer";
     FormBorderStyle = FormBorderStyle.None;
     StartPosition = FormStartPosition.Manual;
@@ -185,8 +195,7 @@ class ViewerForm : Form {
 
   async Task StartWebView() {
     try {
-      CoreWebView2Environment.SetLoaderDllFolderPath(Program.AppDir);
-      CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Program.DataDir, "WebView2"));
+      CoreWebView2Environment env = await engine;
       await web.EnsureCoreWebView2Async(env);
     } catch (Exception e) {
       MessageBox.Show("PDF Viewer needs the Microsoft Edge WebView2 Runtime, which comes with Windows 11.\n\n" + e.Message,
@@ -201,41 +210,54 @@ class ViewerForm : Form {
     s.AreBrowserAcceleratorKeysEnabled = false; // no reload, zoom, find, print…
     s.IsZoomControlEnabled = false;
     s.IsStatusBarEnabled = false;
+    try { s.IsReputationCheckingRequired = false; } catch { } // no SmartScreen check of the app's own page: it cost 50 ms
 
-    core.SetVirtualHostNameToFolderMapping("app.local", Program.AppDir, CoreWebView2HostResourceAccessKind.Allow);
-    core.AddWebResourceRequestedFilter("https://file.local/*", CoreWebView2WebResourceContext.All);
-    core.WebResourceRequested += ServeFile;
+    // The page, and the PDF to open at https://file.example/<name>. A local PDF's folder is handed to
+    // the engine, which reads it straight from the disk; one on the network, the engine won't read
+    // itself, so this app serves it.
+    // Not .local names: Windows looks those up on the network first, which held the page back 2 seconds.
+    core.SetVirtualHostNameToFolderMapping("app.example", Program.AppDir, CoreWebView2HostResourceAccessKind.Allow);
+    if (startFile != null && !OnNetwork(startFile)) {
+      core.SetVirtualHostNameToFolderMapping("file.example", Path.GetDirectoryName(startFile), CoreWebView2HostResourceAccessKind.Allow);
+    } else if (startFile != null) {
+      core.AddWebResourceRequestedFilter("https://file.example/*", CoreWebView2WebResourceContext.All);
+      core.WebResourceRequested += ServeFile;
+    }
     core.WebMessageReceived += OnMessage;
     core.DocumentTitleChanged += delegate { Text = core.DocumentTitle; };
     core.NewWindowRequested += delegate(object sender, CoreWebView2NewWindowRequestedEventArgs e) { e.Handled = true; };
     core.NavigationStarting += delegate(object sender, CoreWebView2NavigationStartingEventArgs e) {
-      if (!e.Uri.StartsWith("https://app.local/", StringComparison.OrdinalIgnoreCase)) e.Cancel = true;
+      if (!e.Uri.StartsWith("https://app.example/", StringComparison.OrdinalIgnoreCase)) e.Cancel = true;
     };
     EventHandler<CoreWebView2NavigationCompletedEventArgs> ready = null;
     ready = delegate {
       core.NavigationCompleted -= ready;
       SendState();
-      if (startFile != null) OpenInPage(startFile);
       if (ActiveForm == this) web.Focus();
     };
     core.NavigationCompleted += ready;
-    core.Navigate("https://app.local/index.html");
+    // The PDF's name goes in the address, so the page starts loading it straight away.
+    core.Navigate("https://app.example/index.html" +
+      (startFile == null ? "" : "?open=" + Uri.EscapeDataString(Path.GetFileName(startFile))));
   }
 
-  void OpenInPage(string path) {
-    servedFile = path;
-    Post("{\"type\":\"open-file\",\"name\":" + Json(Path.GetFileName(path)) + "}");
+  // A \\server\share path or a mapped network drive.
+  static bool OnNetwork(string path) {
+    try {
+      return new Uri(path).IsUnc || new DriveInfo(Path.GetPathRoot(path)).DriveType == DriveType.Network;
+    } catch {
+      return true; // when in doubt, the way that always works
+    }
   }
 
-  // The page fetches the opened PDF from https://file.local/<name>.
   void ServeFile(object sender, CoreWebView2WebResourceRequestedEventArgs e) {
     CoreWebView2Environment env = web.CoreWebView2.Environment;
     try {
-      Stream data = File.OpenRead(servedFile);
+      Stream data = File.OpenRead(startFile);
       e.Response = env.CreateWebResourceResponse(data, 200, "OK",
-        "Content-Type: application/pdf\r\nAccess-Control-Allow-Origin: https://app.local");
+        "Content-Type: application/pdf\r\nAccess-Control-Allow-Origin: https://app.example");
     } catch {
-      e.Response = env.CreateWebResourceResponse(null, 404, "Not Found", "Access-Control-Allow-Origin: https://app.local");
+      e.Response = env.CreateWebResourceResponse(null, 404, "Not Found", "Access-Control-Allow-Origin: https://app.example");
     }
   }
 

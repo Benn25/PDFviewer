@@ -6,13 +6,16 @@ window with the page in it, and everything else in the right-click menu.
 - **Instant page changes.** Pages are drawn from a cache, never waiting for the renderer: a thumbnail of
   every page is ready shortly after opening, and the next pages are pre-rendered at full resolution.
   One page per wheel notch, never skipping a page, however fast the wheel spins.
+- **Opens in about half a second**, from double-click to the page sharp on screen.
+- **Zoom** with Ctrl+wheel or Ctrl+middle-drag, sharp at any level: zoomed far in, only the part in
+  view is rendered at full resolution.
 - **Full-screen page mode**, fit width / fit page, single page / continuous, always on top.
 - **Small and portable:** a 4.7 MB folder (2.3 MB zipped), no installer. It runs on the WebView2 engine
   that Windows 11 already has.
 
 ## Install
 
-1. Download `PDF Viewer <version>.zip` from the [latest release](https://github.com/Benn25/PDFviewer/releases/latest)
+1. Download `PDF.Viewer.<version>.zip` from the [latest release](https://github.com/Benn25/PDFviewer/releases/latest)
    and unzip it somewhere it can stay.
 2. Double-click **Add to Windows.cmd**: a Start Menu entry, "PDF Viewer" in the *Open with* list of PDF
    files and an *Open with PDF Viewer* right-click entry. It writes only to your own account (HKCU), no
@@ -35,6 +38,9 @@ The app isn't signed, so on first launch Windows may show "Windows protected you
 | ↑ ↓ / Space / wheel | scroll, and turn pages one by one |
 | Home / End | first / last page |
 | A number, then Enter | go to that page |
+| Ctrl+wheel, Ctrl+middle-drag | zoom around the mouse (drag up: in, down: out) |
+| Middle-drag | move the page around |
+| Ctrl+plus / Ctrl+minus / Ctrl+0 | zoom in / out / back to the fit |
 | F, Ctrl+P or double-click | full-screen page mode, and back (Esc leaves too) |
 | Z | fit width ⇄ fit page |
 | C | continuous ⇄ single page |
@@ -62,9 +68,9 @@ git tag v2.3.0
 git push origin main v2.3.0
 ```
 
-GitHub then builds the app on Windows and publishes `PDF Viewer 2.3.0.zip` on the Releases page
-(`.github/workflows/release.yml`). The tag has to match the version in `package.json`. The link to hand
-out for the newest version is https://github.com/Benn25/PDFviewer/releases/latest
+GitHub then builds the app on Windows and publishes `PDF.Viewer.2.3.0.zip` (GitHub turns the spaces
+into dots) on the Releases page (`.github/workflows/release.yml`). The tag has to match the version in
+`package.json`. The link to hand out for the newest version is https://github.com/Benn25/PDFviewer/releases/latest
 
 ## How it's made
 

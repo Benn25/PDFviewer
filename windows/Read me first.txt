@@ -26,7 +26,7 @@ Using it
 There are no toolbars: everything is in the right-click menu.
 
   Drag anywhere ............. move the window (drag its edges to resize)
-  Right-click ............... menu: Open, Fit width / Fit page,
+  Right-click ............... menu: Open, Fit width / Fit page, Reset zoom,
                               Single page / Continuous, Full screen,
                               Fit window to page, Always on top
   Top-right corner .......... a small X fades in as the mouse gets close: close
@@ -34,6 +34,11 @@ There are no toolbars: everything is in the right-click menu.
   Up / Down, Space, wheel ... scroll, and turn pages one by one
   Home / End ................ first / last page
   A number, then Enter ...... go to that page
+  Ctrl+wheel ................ zoom, around the mouse
+  Ctrl+middle-button drag ... zoom: drag up to zoom in, down to zoom out
+  Middle-button drag ........ move the page around (when zoomed in)
+  Ctrl+plus / Ctrl+minus .... zoom in / out
+  Ctrl+0 .................... back to the fit (no zoom)
   F, Ctrl+P or double-click . full-screen page mode, and back (Esc leaves too)
   Z ......................... fit width <-> fit page
   C ......................... continuous <-> single page

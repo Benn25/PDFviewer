@@ -40,8 +40,9 @@
       width: max-content;
       min-width: 100%;
     }
-    .page { flex: none; background: #fff; }
+    .page { position: relative; flex: none; background: #fff; }
     .page canvas { display: block; width: 100%; height: 100%; }
+    .page canvas.detail { position: absolute; } /* placed by the script */
     body.single #pages { min-height: 100%; }
     body.single .page { margin-block: auto; }
     body.single .page:not(.current) { display: none; }
@@ -188,6 +189,7 @@
       <p class="keys">
         <kbd>←</kbd> <kbd>→</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd> change page<br />
         <kbd>F</kbd> or double-click: full screen<br />
+        <kbd>Ctrl</kbd> + wheel: zoom<br />
         <span class="desktop-only">Drag anywhere to move the window</span>
       </p>
     </div>
@@ -205,7 +207,6 @@
     // The app's own copy, the project's node_modules when served over http, the CDN when opened as a plain file.
     const PDFJS_SOURCES = ["./pdfjs/", "./node_modules/pdfjs-dist/", "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/"];
     const GAP = 8; // gap between pages in continuous mode
-    const MAX_CANVAS_PIXELS = 32 * 1024 * 1024;
 
     const $ = (id) => document.getElementById(id);
     const viewer = $("viewer");
@@ -219,8 +220,9 @@
     let pdfjs = null;
     let doc = null;
     let docName = "";
-    let pages = []; // { page, w, h, el, scale, key, task }
+    let pages = []; // { page, w, h, el, scale, canvas, drawn }
     let current = 0;
+    let zoom = 1; // on top of the fit: Ctrl+wheel, Ctrl+middle-drag
     let presenting = false;
     let alwaysOnTop = false;
     let appVersion = ""; // the desktop app's version, shown at the bottom of the menu
@@ -266,11 +268,21 @@
       pdfjs ??= (async () => {
         for (const source of PDFJS_SOURCES) {
           const base = new URL(source, location.href).href;
+          const workerSrc = `${base}build/pdf.worker.min.mjs`;
+          let worker = null;
           try {
+            // The worker (pdf.js' other half, on another core) starts loading alongside the library.
+            // Only a same-origin worker can be started from here; pdf.js copes with the others itself.
+            if (/^https?:$/.test(location.protocol) && new URL(base).origin === location.origin) {
+              worker = new Worker(workerSrc, { type: "module" });
+            }
             const lib = await import(`${base}build/pdf.min.mjs`);
-            lib.GlobalWorkerOptions.workerSrc = `${base}build/pdf.worker.min.mjs`;
+            if (worker) lib.GlobalWorkerOptions.workerPort = worker;
+            else lib.GlobalWorkerOptions.workerSrc = workerSrc;
             return { lib, base };
-          } catch {}
+          } catch {
+            worker?.terminate();
+          }
         }
         throw new Error("pdf.js is unavailable");
       })().catch((e) => {
@@ -282,17 +294,22 @@
 
     // ---- Loading ----
 
-    async function openFile(file) {
-      if (!file) return;
+    function openFile(file) {
+      if (file) openPdf(file.name, file.arrayBuffer());
+    }
+
+    // data: a promise of the file's bytes, which may still be on their way while pdf.js loads.
+    async function openPdf(name, data) {
       const id = ++loadId;
-      showHud(`Loading ${file.name}…`, 60000);
+      data.catch(() => {}); // reported below
+      showHud(`Loading ${name}…`, 60000);
       let lib, newDoc, proxies;
       let cancelled = false;
       try {
         const pdf = await getPdfjs();
         lib = pdf.lib;
         const task = lib.getDocument({
-          data: new Uint8Array(await file.arrayBuffer()),
+          data: new Uint8Array(await data),
           cMapUrl: `${pdf.base}cmaps/`,
           cMapPacked: true,
           standardFontDataUrl: `${pdf.base}standard_fonts/`,
@@ -301,7 +318,7 @@
           const pw = prompt(
             reason === lib.PasswordResponses.INCORRECT_PASSWORD
               ? "Wrong password, try again:"
-              : `"${file.name}" is password protected:`
+              : `"${name}" is password protected:`
           );
           if (pw == null) {
             cancelled = true;
@@ -318,7 +335,7 @@
         if (cancelled) return;
         alert(
           lib
-            ? `Couldn't open "${file.name}":\n${e?.message ?? e}`
+            ? `Couldn't open "${name}":\n${e?.message ?? e}`
             : "Couldn't load the PDF renderer (pdf.js). It needs an internet connection the first time."
         );
         return;
@@ -328,21 +345,22 @@
       resetRendering();
       doc?.destroy();
       doc = newDoc;
-      docName = file.name;
+      docName = name;
       pages = proxies.map((page) => {
         const { width, height } = page.getViewport({ scale: 1 });
         const el = document.createElement("div");
         el.className = "page";
-        return { page, w: width, h: height, el, scale: 1, drawn: null };
+        return { page, w: width, h: height, el, scale: 1, canvas: null, drawn: null };
       });
       pagesEl.replaceChildren(...pages.map((p) => p.el));
       current = 0;
+      zoom = 1;
 
-      document.title = `${file.name} – PDF Viewer`;
+      document.title = `${name} – PDF Viewer`;
       document.body.classList.add("has-doc");
       layout();
       goTo(0);
-      showHud(`${file.name} · ${pages.length} page${pages.length > 1 ? "s" : ""}`, 2000);
+      showHud(`${name} · ${pages.length} page${pages.length > 1 ? "s" : ""}`, 2000);
       viewer.focus({ preventScroll: true });
     }
 
@@ -355,7 +373,7 @@
       const availH = viewer.clientHeight;
       for (const p of pages) {
         const s = fit === "page" ? Math.min(availW / p.w, availH / p.h) : availW / p.w;
-        p.scale = Math.max(s, 0.05);
+        p.scale = Math.max(s * zoom, 0.05);
         p.el.style.width = `${Math.floor(p.w * p.scale)}px`;
         p.el.style.height = `${Math.floor(p.h * p.scale)}px`;
       }
@@ -383,38 +401,90 @@
     //  - Every page gets a small thumbnail early on, so even the wildest flipping shows the page.
     //  - Full-resolution renders follow for the current page, once flipping pauses, and for the next
     //    pages in the direction of travel, so paging at a normal pace lands on pages already sharp.
-    // One pdf.js render runs at a time; a full render nobody is waiting for any more is cancelled.
+    //  - Zoomed in so far that a page would need more than MAX_CANVAS_PIXELS, the whole page stays at
+    //    that size and the part in view is rendered again on top, sharp: the page's "detail".
+    // One pdf.js render runs at a time; a render nobody is waiting for any more is cancelled.
 
+    const MAX_CANVAS_PIXELS = 16 * 1024 * 1024; // a whole page at most (64 MB)
     const THUMB_SIZE = 384; // long side of a thumbnail, px
     const THUMB_MAX = 500; // thumbnails kept (about 0.4 MB each)
     const THUMBS_AHEAD = 40; // thumbnails made first, in the direction of travel
     const FULL_AHEAD = 3; // pages rendered ahead at full resolution
     const FULL_BEHIND = 1;
     const SETTLE_MS = 30; // no full renders while pages change faster than this
+    const ZOOM_SETTLE_MS = 150; // nor while zooming: the pages just stretch meanwhile
+    const STILL_MS = 120; // details wait for scrolling to pause too
+    const DETAIL_MARGIN = 0.25; // a detail covers the view and this much of it all around
 
     const thumbs = new Map(); // page index -> canvas
     const fulls = new Map(); // page index -> { canvas, key }
-    const shown = new Set(); // pages that have a display canvas
+    const details = new Map(); // page index -> { canvas, rect, key }, the canvas sitting on the page
+    const shown = new Set(); // pages in view, which get a canvas as soon as there's an image for them
     const failed = new Set(); // pages pdf.js couldn't render: not retried
     const canvasPool = [];
     let job = null; // the render in progress
     let travel = 1; // direction of the last page change
-    let lastFlip = 0;
-    let settleTimer;
+    let lastFlip = -Infinity; // when pages last flipped, zoomed, scrolled
+    let lastZoom = -Infinity;
+    let lastScroll = -Infinity;
+    let settleTimer, stillTimer;
+    let framed = false; // the first frame is on screen (see run())
+    requestAnimationFrame(() => (framed = true));
 
-    // The page's size on screen, in device pixels.
-    function deviceSize(p) {
-      const dpr = window.devicePixelRatio || 1;
-      const w = Math.floor(p.w * p.scale) * dpr;
-      const h = Math.floor(p.h * p.scale) * dpr;
-      const k = Math.min(1, Math.sqrt(MAX_CANVAS_PIXELS / (w * h)));
-      return { w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) };
-    }
+    const since = (t) => performance.now() - t;
+    const settled = () => since(lastFlip) >= SETTLE_MS && since(lastZoom) >= ZOOM_SETTLE_MS;
+    const still = () => settled() && since(lastScroll) >= STILL_MS;
     const sizeKey = (s) => `${s.w}x${s.h}`;
     const inRange = (i) => i >= 0 && i < pages.length;
-    const settled = () => performance.now() - lastFlip >= SETTLE_MS;
+
+    // The page's size on screen, in device pixels.
+    function screenSize(p) {
+      const dpr = window.devicePixelRatio || 1;
+      return { w: Math.max(1, Math.round(Math.floor(p.w * p.scale) * dpr)), h: Math.max(1, Math.round(Math.floor(p.h * p.scale) * dpr)) };
+    }
+    const zoomedIn = (p) => { const s = screenSize(p); return s.w * s.h > MAX_CANVAS_PIXELS; };
+
+    // The size of the page's whole-page image: its size on screen, or, zoomed in further, a fixed size
+    // whatever the zoom (the detail brings the sharpness).
+    function deviceSize(p) {
+      if (!zoomedIn(p)) return screenSize(p);
+      const aspect = p.w / p.h;
+      return { w: Math.round(Math.sqrt(MAX_CANVAS_PIXELS * aspect)), h: Math.round(Math.sqrt(MAX_CANVAS_PIXELS / aspect)) };
+    }
+
     const needsFull = (i) => !failed.has(i) && fulls.get(i)?.key !== sizeKey(deviceSize(pages[i]));
     const needsThumb = (i) => !failed.has(i) && !thumbs.has(i);
+
+    // The detail page i should have, in device pixels of the page as it is on screen: the part in view
+    // and a margin around it. Null when the page isn't zoomed in that far or isn't in view.
+    function detailWanted(i) {
+      const p = pages[i];
+      if (failed.has(i) || !zoomedIn(p)) return null;
+      const size = screenSize(p);
+      const dpr = window.devicePixelRatio || 1;
+      const x = (viewer.scrollLeft - p.el.offsetLeft) * dpr;
+      const y = (viewer.scrollTop - p.el.offsetTop) * dpr;
+      const w = viewer.clientWidth * dpr;
+      const h = viewer.clientHeight * dpr;
+      const seen = clip([x, y, x + w, y + h], size);
+      if (!seen) return null;
+      const mx = w * DETAIL_MARGIN;
+      const my = h * DETAIL_MARGIN;
+      return { size, key: sizeKey(size), seen, rect: clip([x - mx, y - my, x + w + mx, y + h + my], size) };
+    }
+
+    // A rectangle [left, top, right, bottom] cut to a page of that size, on whole pixels; null if empty.
+    function clip([x0, y0, x1, y1], size) {
+      const r = [Math.max(0, Math.floor(x0)), Math.max(0, Math.floor(y0)), Math.min(size.w, Math.ceil(x1)), Math.min(size.h, Math.ceil(y1))];
+      return r[2] > r[0] && r[3] > r[1] ? r : null;
+    }
+    const contains = (a, b) => a[0] <= b[0] && a[1] <= b[1] && a[2] >= b[2] && a[3] >= b[3];
+
+    function needsDetail(i) {
+      const want = detailWanted(i);
+      const d = details.get(i);
+      return !!want && !(d && d.key === want.key && contains(d.rect, want.seen));
+    }
 
     function visiblePages() {
       if (view().mode === "single") return [current];
@@ -436,41 +506,70 @@
       pump();
     }
 
+    // Calls update() once renders held back by flipping, zooming or scrolling may start.
+    function wake() {
+      const settle = Math.max(SETTLE_MS - since(lastFlip), ZOOM_SETTLE_MS - since(lastZoom), 0);
+      clearTimeout(settleTimer);
+      clearTimeout(stillTimer);
+      settleTimer = setTimeout(update, settle + 1);
+      stillTimer = setTimeout(update, Math.max(settle, STILL_MS - since(lastScroll)) + 1);
+    }
+
     function paint(i) {
       const p = pages[i];
       const size = deviceSize(p);
       const full = fulls.get(i);
       const source = full?.canvas ?? thumbs.get(i);
-      let c = p.el.firstChild;
+      shown.add(i);
+      paintDetail(i);
+      if (!source) return; // the canvas comes with the first image: see run() for why
+      let c = p.canvas;
       if (!c) {
-        c = canvasPool.pop() ?? document.createElement("canvas");
+        c = p.canvas = canvasPool.pop() ?? document.createElement("canvas");
         c.getContext("2d").clearRect(0, 0, c.width, c.height); // may still hold another page
-        p.el.append(c);
-        shown.add(i);
+        p.el.prepend(c);
         p.drawn = null;
       }
-      if (c.width !== size.w || c.height !== size.h) {
+      // While zooming, the canvas just stretches with the page; it's redrawn at its size once zooming pauses.
+      if ((!p.drawn || since(lastZoom) >= ZOOM_SETTLE_MS) && (c.width !== size.w || c.height !== size.h)) {
         c.width = size.w;
         c.height = size.h;
         p.drawn = null;
       }
-      if (!source || p.drawn === source) return;
-      c.getContext("2d").drawImage(source, 0, 0, size.w, size.h);
+      if (p.drawn === source) return;
+      c.getContext("2d").drawImage(source, 0, 0, c.width, c.height);
       p.drawn = source;
       p.el.dataset.quality = !full ? "thumb" : full.key === sizeKey(size) ? "full" : "resized";
     }
 
+    function paintDetail(i) {
+      const d = details.get(i);
+      if (!d) return;
+      if (!zoomedIn(pages[i])) return dropDetail(i); // zoomed back out: the whole page is sharp again
+      if (!d.canvas.isConnected) pages[i].el.append(d.canvas);
+    }
+
     function hide(i) {
       const p = pages[i];
-      const c = p.el.firstChild;
+      const c = p.canvas;
       if (c) {
         c.remove();
         if (canvasPool.length < 4) canvasPool.push(c);
         else c.width = c.height = 0;
+        p.canvas = null;
       }
+      dropDetail(i);
       shown.delete(i);
       p.drawn = null;
       delete p.el.dataset.quality;
+    }
+
+    function dropDetail(i) {
+      const d = details.get(i);
+      if (!d) return;
+      d.canvas.remove();
+      d.canvas.width = d.canvas.height = 0;
+      details.delete(i);
     }
 
     function evict(visible) {
@@ -491,13 +590,17 @@
 
     function nextJob() {
       const calm = settled();
+      const quiet = still();
+      // Zoomed in, the current page's detail comes first: its whole-page image is only a backdrop then.
+      if (quiet && needsDetail(current)) return { i: current, detail: true };
       if (calm && needsFull(current)) return { i: current, full: true };
       for (let k = 0; k <= THUMBS_AHEAD; k++) {
         const i = current + travel * k;
-        if (inRange(i) && needsThumb(i)) return { i, full: false };
+        if (inRange(i) && needsThumb(i)) return { i };
       }
       if (calm) {
         for (const i of visiblePages()) if (needsFull(i)) return { i, full: true };
+        if (quiet) for (const i of visiblePages()) if (needsDetail(i)) return { i, detail: true };
         for (let k = 1; k <= FULL_AHEAD; k++) {
           const i = current + travel * k;
           if (inRange(i) && needsFull(i)) return { i, full: true };
@@ -510,7 +613,7 @@
       if (thumbs.size < THUMB_MAX) {
         for (let k = 1; k < pages.length; k++) {
           for (const i of [current - travel * k, current + travel * k]) {
-            if (inRange(i) && needsThumb(i)) return { i, full: false };
+            if (inRange(i) && needsThumb(i)) return { i };
           }
         }
       }
@@ -519,9 +622,15 @@
 
     // Still worth finishing? While pages flip, only the page on screen is.
     function stillWanted(j) {
+      if (j.detail) {
+        const want = still() && detailWanted(j.i);
+        return !!want && want.key === j.key && contains(j.rect, want.seen);
+      }
       if (!j.full) return true; // thumbnails are quick and always useful
+      if (j.key !== sizeKey(deviceSize(pages[j.i]))) return false; // zoomed, or the window was resized
       if (!settled()) return j.i === current;
       if (j.i !== current && needsFull(current)) return false; // the page on screen comes first
+      if (still() && needsDetail(current)) return false; // and then its detail
       return Math.abs(j.i - current) <= FULL_AHEAD || visiblePages().includes(j.i);
     }
 
@@ -541,21 +650,52 @@
     async function run(j) {
       const owner = doc;
       const p = pages[j.i];
-      const size = j.full ? deviceSize(p) : null;
-      const scale = j.full ? size.w / p.w : THUMB_SIZE / Math.max(p.w, p.h);
-      const viewport = p.page.getViewport({ scale });
       const canvas = document.createElement("canvas");
-      canvas.width = j.full ? size.w : Math.max(1, Math.round(viewport.width));
-      canvas.height = j.full ? size.h : Math.max(1, Math.round(viewport.height));
+      let viewport;
+      if (j.detail) {
+        // The page at its size on screen, shifted so that the detail's corner lands on the canvas'.
+        const want = detailWanted(j.i);
+        const [x0, y0, x1, y1] = want.rect;
+        Object.assign(j, { key: want.key, size: want.size, rect: want.rect });
+        viewport = p.page.getViewport({ scale: want.size.w / p.w, offsetX: -x0, offsetY: -y0 });
+        canvas.width = x1 - x0;
+        canvas.height = y1 - y0;
+      } else if (j.full) {
+        const size = deviceSize(p);
+        j.key = sizeKey(size);
+        viewport = p.page.getViewport({ scale: size.w / p.w });
+        canvas.width = size.w;
+        canvas.height = size.h;
+      } else {
+        viewport = p.page.getViewport({ scale: THUMB_SIZE / Math.max(p.w, p.h) });
+        canvas.width = Math.max(1, Math.round(viewport.width));
+        canvas.height = Math.max(1, Math.round(viewport.height));
+      }
       job = j;
-      j.task = p.page.render({ canvasContext: canvas.getContext("2d"), viewport });
+      // Until the first frame is on screen, the graphics engine is still starting and a canvas on the GPU
+      // would wait for it. So the first page is rendered on the CPU meanwhile, which shows it ~50 ms sooner.
+      const context = canvas.getContext("2d", framed ? {} : { willReadFrequently: true });
+      j.task = p.page.render({ canvasContext: context, viewport });
       try {
         await j.task.promise;
         if (owner !== doc) return;
-        if (j.full) {
+        if (j.detail) {
+          const [x0, y0, x1, y1] = j.rect;
+          const { w, h } = j.size;
+          canvas.className = "detail";
+          // In % of the page, so it stays in place while the page stretches during a zoom.
+          Object.assign(canvas.style, {
+            left: `${(x0 / w) * 100}%`,
+            top: `${(y0 / h) * 100}%`,
+            width: `${((x1 - x0) / w) * 100}%`,
+            height: `${((y1 - y0) / h) * 100}%`,
+          });
+          dropDetail(j.i);
+          details.set(j.i, { canvas, rect: j.rect, key: j.key });
+        } else if (j.full) {
           const old = fulls.get(j.i);
           if (old) old.canvas.width = old.canvas.height = 0;
-          fulls.set(j.i, { canvas, key: sizeKey(size) });
+          fulls.set(j.i, { canvas, key: j.key });
         } else {
           thumbs.set(j.i, canvas);
         }
@@ -578,6 +718,7 @@
         job.task.cancel();
         job = null;
       }
+      for (const i of [...details.keys()]) dropDetail(i);
       for (const c of [...thumbs.values(), ...[...fulls.values()].map((f) => f.canvas), ...canvasPool]) {
         c.width = c.height = 0;
       }
@@ -586,7 +727,7 @@
       shown.clear();
       failed.clear();
       canvasPool.length = 0;
-      lastFlip = 0;
+      lastFlip = lastZoom = lastScroll = -Infinity;
     }
 
     // ---- Navigation ----
@@ -597,8 +738,7 @@
       if (pages[current]?.el.classList.contains("current")) {
         travel = i > current ? 1 : -1;
         lastFlip = performance.now();
-        clearTimeout(settleTimer);
-        settleTimer = setTimeout(pump, SETTLE_MS);
+        wake();
       }
       pages[current]?.el.classList.remove("current");
       current = i;
@@ -657,7 +797,11 @@
     // In continuous mode the current page is the one crossing the top third of the view.
     function pageAtScroll() {
       if (viewer.scrollTop > 0 && atEnd(1)) return pages.length - 1;
-      const line = viewer.scrollTop + viewer.clientHeight / 3;
+      return pageAtLine(viewer.scrollTop + viewer.clientHeight / 3);
+    }
+
+    // Continuous mode: the page at that height in the document (or the one just above, between pages).
+    function pageAtLine(line) {
       let lo = 0, hi = pages.length - 1;
       while (lo < hi) {
         const mid = (lo + hi + 1) >> 1;
@@ -683,20 +827,63 @@
       requestAnimationFrame(() => {
         scrollQueued = false;
         if (!doc) return;
+        lastScroll = performance.now();
         if (ignoreScroll) ignoreScroll = false;
         else if (view().mode === "continuous") setCurrent(pageAtScroll());
         update();
+        wake();
       });
     });
 
     new ResizeObserver(relayout).observe(viewer);
+
+    // ---- Zoom ----
+    //
+    // A factor on top of the fit (Ctrl+0 goes back to it), around a point of the view that stays put.
+
+    const ZOOM_MIN = 0.25;
+    const ZOOM_MAX = 32;
+    const ZOOM_STEP = 1.2; // per wheel notch or key press
+
+    function zoomTo(z, x = viewer.clientWidth / 2, y = viewer.clientHeight / 2) {
+      if (!doc) return;
+      z = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));
+      if (z === zoom) return;
+      const el = pages[view().mode === "single" ? current : pageAtLine(viewer.scrollTop + y)].el;
+      const fx = (viewer.scrollLeft + x - el.offsetLeft) / el.offsetWidth;
+      const fy = (viewer.scrollTop + y - el.offsetTop) / el.offsetHeight;
+      zoom = z;
+      lastZoom = lastScroll = performance.now();
+      layout();
+      viewer.scrollLeft = el.offsetLeft + fx * el.offsetWidth - x;
+      viewer.scrollTop = el.offsetTop + fy * el.offsetHeight - y;
+      update();
+      wake();
+      showHud(`${Math.round(pages[current].scale * 75)}%`); // 100% = the page's printed size
+    }
+
+    // Wheel and mouse moves can come several times a frame: they're gathered into one zoom per frame.
+    let zoomQueued = null;
+    function zoomLater(z, x, y) {
+      if (!zoomQueued) {
+        requestAnimationFrame(() => {
+          const q = zoomQueued;
+          zoomQueued = null;
+          zoomTo(q.z, q.x, q.y);
+        });
+      }
+      zoomQueued = { z: Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z)), x, y };
+    }
+
+    const zoomBy = (factor, x, y) => zoomLater((zoomQueued?.z ?? zoom) * factor, x, y);
 
     // ---- Modes ----
 
     function setFit(fit) {
       prefs.fit = fit;
       savePrefs();
-      if (!presenting) relayout();
+      zoom = 1;
+      relayout();
     }
 
     function setMode(mode) {
@@ -713,6 +900,7 @@
       presenting = on;
       document.body.classList.toggle("presenting", on);
       showCursor();
+      zoom = 1;
       if (!doc) return;
       layout();
       goTo(current);
@@ -775,6 +963,7 @@
         // A toggle's key is shown on the choice it switches to.
         { label: "Fit width", key: prefs.fit === "page" ? "Z" : "", checked: prefs.fit === "width", run: () => setFit("width") },
         { label: "Fit page", key: prefs.fit === "width" ? "Z" : "", checked: prefs.fit === "page", run: () => setFit("page") },
+        { label: "Reset zoom", key: "Ctrl+0", disabled: !doc || zoom === 1, run: () => zoomTo(1) },
         "-",
         { label: "Single page", key: prefs.mode === "continuous" ? "C" : "", checked: prefs.mode === "single", run: () => setMode("single") },
         { label: "Continuous", key: prefs.mode === "single" ? "C" : "", checked: prefs.mode === "continuous", run: () => setMode("continuous") },
@@ -882,6 +1071,15 @@
         } else if (k === "w" && desktop) {
           e.preventDefault();
           desktop.close();
+        } else if (k === "=" || k === "+" || k === ";") {
+          e.preventDefault(); // ";" is the "+" key of Japanese keyboards
+          zoomBy(ZOOM_STEP);
+        } else if (k === "-") {
+          e.preventDefault();
+          zoomBy(1 / ZOOM_STEP);
+        } else if (k === "0") {
+          e.preventDefault();
+          zoomTo(1);
         }
         return;
       }
@@ -936,14 +1134,19 @@
 
     // Single page: once the page can't scroll further, the wheel turns one page per notch,
     // however fast it spins (see step()). Touchpads add their small movements up to a notch.
+    // With Ctrl, the wheel zooms around the mouse (as does a touchpad pinch).
     let notch = 100; // px per wheel notch; the desktop app reports Windows' setting
     let wheelRest = 0;
     viewer.addEventListener(
       "wheel",
       (e) => {
         closeMenu();
-        if (!doc || e.ctrlKey || view().mode !== "single") return;
         const delta = e.deltaMode ? e.deltaY * (100 / 3) : e.deltaY;
+        if (e.ctrlKey) {
+          e.preventDefault();
+          return zoomBy(ZOOM_STEP ** (-delta / notch), e.clientX, e.clientY);
+        }
+        if (!doc || view().mode !== "single") return;
         const dir = Math.sign(delta);
         if (!dir || !atEnd(dir)) {
           wheelRest = 0;
@@ -966,6 +1169,34 @@
 
     // Double-click: full screen, and back.
     viewer.addEventListener("dblclick", () => toggleFullscreen());
+
+    // Middle button: drag to move the pages around; with Ctrl, drag up to zoom in, down to zoom out.
+    let middle = null; // the drag in progress: where it started, with the zoom and scroll there
+    viewer.addEventListener("pointerdown", (e) => {
+      if (e.button !== 1 || !doc) return;
+      viewer.setPointerCapture(e.pointerId);
+      middle = { zoom: e.ctrlKey, x: e.clientX, y: e.clientY, from: zoom, left: viewer.scrollLeft, top: viewer.scrollTop };
+      viewer.style.cursor = e.ctrlKey ? "zoom-in" : "grabbing";
+    });
+    viewer.addEventListener("pointermove", (e) => {
+      if (!middle) return;
+      if (middle.zoom) {
+        zoomLater(middle.from * 2 ** ((middle.y - e.clientY) / 200), middle.x, middle.y); // 200 px up: twice the size
+      } else {
+        viewer.scrollLeft = middle.left - (e.clientX - middle.x);
+        viewer.scrollTop = middle.top - (e.clientY - middle.y);
+      }
+    });
+    const endMiddle = (e) => {
+      if (!middle || e.buttons & 4) return;
+      middle = null;
+      viewer.style.cursor = "";
+    };
+    viewer.addEventListener("pointerup", endMiddle);
+    viewer.addEventListener("pointercancel", endMiddle);
+    viewer.addEventListener("mousedown", (e) => {
+      if (e.button === 1) e.preventDefault(); // not the browser's autoscroll
+    });
 
     // Desktop app: drag anywhere with the left button to move the window, drag its edges to resize it.
     // The move starts once the mouse has moved a little, so clicks and double-clicks still reach the page.
@@ -1065,14 +1296,20 @@
         announceOnTop = false;
       });
       desktop.on("left-full-screen", () => setPresenting(false));
-      // A PDF passed on the command line ("Open with…"), served by the app at https://file.local/.
-      desktop.on("open-file", async ({ name }) => {
-        const response = await fetch(`https://file.local/${encodeURIComponent(name)}`);
-        if (response.ok) openFile(new File([await response.blob()], name, { type: "application/pdf" }));
-      });
     }
     viewer.focus({ preventScroll: true });
-    getPdfjs().catch(() => {}); // warm up while the user picks a file
+    getPdfjs().catch(() => {}); // starts loading now: while the user picks a file, or with the file below
+
+    // Desktop app: the PDF it was started with ("Open with…"), named in the address. The app serves
+    // its folder at https://file.example/. The file, pdf.js and its worker all load at the same time.
+    const startFile = desktop && new URLSearchParams(location.search).get("open");
+    if (startFile) {
+      const data = fetch(`https://file.example/${encodeURIComponent(startFile)}`, { cache: "no-store" }).then((r) => {
+        if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+        return r.arrayBuffer();
+      });
+      openPdf(startFile, data);
+    }
   </script>
 </body>
 </html>
