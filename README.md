@@ -12,7 +12,8 @@ window with the page in it, and everything else in the right-click menu.
 
 ## Install
 
-1. Get `PDF Viewer <version>.zip` (from Releases, or build it as below) and unzip it somewhere it can stay.
+1. Download `PDF Viewer <version>.zip` from the [latest release](https://github.com/Benn25/PDFviewer/releases/latest)
+   and unzip it somewhere it can stay.
 2. Double-click **Add to Windows.cmd**: a Start Menu entry, "PDF Viewer" in the *Open with* list of PDF
    files and an *Open with PDF Viewer* right-click entry. It writes only to your own account (HKCU), no
    administrator rights.
@@ -52,7 +53,18 @@ npm run build     # dist\PDF Viewer\ and dist\PDF Viewer <version>.zip
 npm run deploy    # the same, then copies it over an installed copy (path in package.json)
 ```
 
-The version comes from `package.json`: bump it there for each release.
+## Release
+
+Bump `"version"` in `package.json`, commit, then tag and push:
+
+```
+git tag v2.3.0
+git push origin main v2.3.0
+```
+
+GitHub then builds the app on Windows and publishes `PDF Viewer 2.3.0.zip` on the Releases page
+(`.github/workflows/release.yml`). The tag has to match the version in `package.json`. The link to hand
+out for the newest version is https://github.com/Benn25/PDFviewer/releases/latest
 
 ## How it's made
 

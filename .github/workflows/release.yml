@@ -1,0 +1,49 @@
+# Pushing a version tag (v2.3.0, ...) builds the app on Windows and publishes
+# "PDF Viewer <version>.zip" as a GitHub release. The tag must match package.json.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # to create the release
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check the tag matches package.json
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} doesn't match package.json ($version): bump the version there first."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $notes = @"
+          **Install:** unzip it somewhere it can stay, then double-click **Add to Windows.cmd**.
+          **Update:** close the viewer and unzip over the old folder.
+          Windows 10 or 11, 64-bit. Details in the read-me inside the zip.
+          "@
+          gh release create $env:GITHUB_REF_NAME "dist/PDF Viewer $env:VERSION.zip" `
+            --title "PDF Viewer $env:VERSION" --notes $notes
