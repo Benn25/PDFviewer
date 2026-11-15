@@ -175,7 +175,19 @@
       pointer-events: none;
     }
     #drop.show { display: grid; }
+
+    /* Printing: only the page images, one per sheet (see print()) */
+    #print { display: none; }
+    @media print {
+      html, body { height: auto; overflow: visible; background: none; }
+      body > :not(#print) { display: none !important; }
+      #print { display: block; }
+      #print .sheet { overflow: hidden; break-after: page; }
+      #print .sheet:last-child { break-after: auto; }
+      #print img { display: block; width: 100%; height: 100%; }
+    }
   </style>
+  <style id="print-sizes"></style>
 </head>
 <body>
   <main id="viewer" tabindex="-1">
@@ -201,6 +213,7 @@
   </button>
   <div id="menu" hidden></div>
   <div id="drop">Drop to open</div>
+  <div id="print"></div>
   <input id="file-input" type="file" accept="application/pdf,.pdf" hidden />
 
   <script type="module">
@@ -216,7 +229,18 @@
     const menu = $("menu");
     const desktop = window.chrome?.webview ? createDesktop(window.chrome.webview) : null;
 
+    // Desktop app: until the page has something to show, the app covers it with the PDF's name. It's
+    // told to step aside once the first page is on screen, or right away before a message box.
+    let covered = !!desktop;
+    function uncover(now = false) {
+      if (!covered) return;
+      covered = false;
+      if (now) desktop.uncover();
+      else requestAnimationFrame(() => requestAnimationFrame(() => desktop.uncover()));
+    }
+
     const prefs = loadPrefs();
+    desktop?.rememberView(prefs);
     let pdfjs = null;
     let doc = null;
     let docName = "";
@@ -245,6 +269,9 @@
         toggleAlwaysOnTop: () => send("topmost"),
         minimize: () => send("minimize"),
         close: () => send("close"),
+        uncover: () => send("uncover"),
+        // The app keeps these too: it lays out its preview of page 1 the same way, before this page exists.
+        rememberView: ({ fit, mode }) => send(`view:${fit},${mode}`),
         on: (type, handler) => (handlers[type] = handler),
       };
     }
@@ -262,6 +289,7 @@
       try {
         localStorage.setItem("pdf-viewer-prefs", JSON.stringify(prefs));
       } catch {}
+      desktop?.rememberView(prefs);
     }
 
     function getPdfjs() {
@@ -315,6 +343,7 @@
           standardFontDataUrl: `${pdf.base}standard_fonts/`,
         });
         task.onPassword = (update, reason) => {
+          uncover(true);
           const pw = prompt(
             reason === lib.PasswordResponses.INCORRECT_PASSWORD
               ? "Wrong password, try again:"
@@ -332,6 +361,7 @@
       } catch (e) {
         if (id !== loadId) return;
         hideHud();
+        uncover(true);
         if (cancelled) return;
         alert(
           lib
@@ -539,6 +569,7 @@
       if (p.drawn === source) return;
       c.getContext("2d").drawImage(source, 0, 0, c.width, c.height);
       p.drawn = source;
+      if (i === current) uncover();
       p.el.dataset.quality = !full ? "thumb" : full.key === sizeKey(size) ? "full" : "resized";
     }
 
@@ -635,7 +666,7 @@
     }
 
     function pump() {
-      if (!doc) return;
+      if (!doc || printing) return;
       if (job) {
         if (!job.cancelled && !stillWanted(job)) {
           job.cancelled = true;
@@ -946,6 +977,94 @@
       hud.classList.remove("show");
     }
 
+    // ---- Printing ----
+    //
+    // Each page is rendered as an image at PRINT_DPI and laid out on a sheet of its own size, for print
+    // only. The print dialog then does the rest: printer, pages, copies, or Save as PDF.
+
+    const PRINT_DPI = 300;
+    const PRINT_MAX_PIXELS = 32 * 1024 * 1024; // bigger pages print at a lower resolution
+    const printEl = $("print");
+    const printSizes = $("print-sizes");
+    let printing = null; // { preparing, cancelled, task, urls } from the first page rendered to the dialog closing
+
+    async function print() {
+      if (!doc || printing) return;
+      const job = (printing = { preparing: true, cancelled: false, task: null, urls: [] });
+      const owner = doc;
+      const stopped = () => job.cancelled || doc !== owner;
+      try {
+        const { lib } = await getPdfjs();
+        const names = new Map(); // a page size, "Wpt Hpt" -> its @page rule
+        const sheets = [];
+        const compressing = [];
+        for (const [i, p] of pages.entries()) {
+          if (stopped()) return;
+          showHud(`Preparing to print… ${i + 1} / ${pages.length}`, 60000);
+          const viewport = p.page.getViewport({ scale: Math.min(PRINT_DPI / 72, Math.sqrt(PRINT_MAX_PIXELS / (p.w * p.h))) });
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.round(viewport.width);
+          canvas.height = Math.round(viewport.height);
+          job.task = p.page.render({
+            canvasContext: canvas.getContext("2d"),
+            viewport,
+            intent: "print", // what pdf.js' own viewer prints: annotations marked for print, form values
+            annotationMode: lib.AnnotationMode.ENABLE_STORAGE,
+          });
+          await job.task.promise;
+          if (stopped()) return;
+          // The image is compressed off the main thread while the next page renders; a few at a time.
+          // JPEG, which the print dialog passes through as it is: its preview shows in under 2 s, not 5.
+          const img = new Image();
+          compressing.push(
+            new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.95)).then((blob) => {
+              canvas.width = canvas.height = 0;
+              img.src = URL.createObjectURL(blob);
+              job.urls.push(img.src);
+              return img.decode();
+            })
+          );
+          if (compressing.length > 2) await compressing.shift();
+          const size = `${p.w}pt ${p.h}pt`;
+          if (!names.has(size)) names.set(size, `size${names.size}`);
+          const sheet = document.createElement("div");
+          sheet.className = "sheet";
+          Object.assign(sheet.style, { page: names.get(size), width: `${p.w}pt`, height: `${p.h}pt` });
+          sheet.append(img);
+          sheets.push(sheet);
+        }
+        await Promise.all(compressing);
+        if (stopped()) return;
+        // Each sheet on paper of its page's size; the first size also for printers that ignore the others.
+        printSizes.textContent =
+          `@page { size: ${[...names.keys()][0]}; margin: 0; }\n` +
+          [...names].map(([size, name]) => `@page ${name} { size: ${size}; }`).join("\n");
+        printEl.replaceChildren(...sheets);
+        hideHud();
+        job.preparing = false;
+        const closed = new Promise((resolve) => addEventListener("afterprint", resolve, { once: true }));
+        window.print();
+        await closed;
+      } catch (e) {
+        if (e?.name !== "RenderingCancelledException" && !stopped()) {
+          console.error(e);
+          alert(`Couldn't print:\n${e?.message ?? e}`);
+        }
+      } finally {
+        for (const url of job.urls) URL.revokeObjectURL(url);
+        printEl.replaceChildren();
+        printSizes.textContent = "";
+        printing = null;
+        update(); // page renders wait while printing is prepared
+      }
+    }
+
+    function cancelPrint() {
+      printing.cancelled = true;
+      printing.task?.cancel();
+      showHud("Printing cancelled");
+    }
+
     let cursorTimer;
     function showCursor() {
       document.body.classList.remove("hide-cursor");
@@ -959,6 +1078,7 @@
     function openMenu(x, y) {
       const items = [
         { label: "Open…", key: "Ctrl+O", run: () => fileInput.click() },
+        { label: "Print…", key: "Ctrl+P", disabled: !doc, run: print },
         "-",
         // A toggle's key is shown on the choice it switches to.
         { label: "Fit width", key: prefs.fit === "page" ? "Z" : "", checked: prefs.fit === "width", run: () => setFit("width") },
@@ -1053,6 +1173,7 @@
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         if (!menu.hidden) closeMenu();
+        else if (printing?.preparing) cancelPrint();
         else if (typed) typeDigit("");
         // In browser full screen the browser leaves it on Esc by itself.
         else if (presenting && !document.fullscreenElement) exitFullscreen();
@@ -1066,7 +1187,10 @@
           e.preventDefault();
           fileInput.click();
         } else if (k === "p") {
-          e.preventDefault(); // full screen, as in Acrobat Reader, rather than print
+          e.preventDefault();
+          print();
+        } else if (k === "l") {
+          e.preventDefault(); // full screen, as in Acrobat Reader
           toggleFullscreen();
         } else if (k === "w" && desktop) {
           e.preventDefault();
@@ -1309,6 +1433,8 @@
         return r.arrayBuffer();
       });
       openPdf(startFile, data);
+    } else {
+      uncover();
     }
   </script>
 </body>

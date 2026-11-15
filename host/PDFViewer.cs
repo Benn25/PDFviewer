@@ -6,18 +6,23 @@
 // (C# 5: no string interpolation, no ?. operator).
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
+using Timer = System.Windows.Forms.Timer;
 
 [assembly: AssemblyTitle("PDF Viewer")]
 [assembly: AssemblyProduct("PDF Viewer")]
@@ -47,8 +52,6 @@ static class Program {
   // Kept apart from Main so the WebView2 types load only once AssemblyResolve is in place.
   [MethodImpl(MethodImplOptions.NoInlining)]
   static void Run(string[] args) {
-    // The browser engine takes the longest to start, so it starts first, while the window is made.
-    Task<CoreWebView2Environment> engine = StartEngine();
     string file = null;
     foreach (string arg in args) {
       if (arg.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase) && File.Exists(arg)) {
@@ -56,15 +59,267 @@ static class Program {
         break;
       }
     }
-    Application.Run(new ViewerForm(file, engine));
+    // Page 1 starts rendering before anything else, alongside the window and the browser engine.
+    Preview preview = file == null ? null : Preview.Start(file);
+    Application.Run(new ViewerForm(file, preview));
+  }
+}
+
+// Until the page shows the PDF, the window shows the pages in view as Windows' own PDF engine draws
+// them, placed exactly where the page will show them; or the PDF's name, until that's ready or if it
+// can't. The window is on screen at once, while the browser engine takes another half second to start.
+class Cover : Control {
+  Preview preview;
+
+  public Cover(string text) {
+    Text = text;
+    Dock = DockStyle.Fill;
+    ForeColor = Color.FromArgb(0x9b, 0x9d, 0xa4);
+    Font = new Font("Segoe UI", 11f);
+    SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
   }
 
-  static async Task<CoreWebView2Environment> StartEngine() {
-    CoreWebView2Environment.SetLoaderDllFolderPath(AppDir);
-    CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions();
-    options.EnableTrackingPrevention = false; // only the app's own page is ever shown: nothing to track
-    return await CoreWebView2Environment.CreateAsync(null, Path.Combine(DataDir, "WebView2"), options);
+  public void ShowPreview(Preview p) {
+    preview = p;
+    Invalidate();
   }
+
+  protected override void OnPaint(PaintEventArgs e) {
+    e.Graphics.Clear(BackColor);
+    if (preview != null) {
+      // Pixel for pixel, the quickest: opaque pages, copied rather than blended. Should the window be
+      // resized in the moment before the page takes over, they stay where they were.
+      e.Graphics.CompositingMode = CompositingMode.SourceCopy;
+      for (int i = 0; i < preview.Images.Count; i++) e.Graphics.DrawImageUnscaled(preview.Images[i], preview.Spots[i].Location);
+      return;
+    }
+    TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor,
+      TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.EndEllipsis);
+  }
+
+  protected override void Dispose(bool disposing) {
+    if (disposing && preview != null) preview.Dispose();
+    base.Dispose(disposing);
+  }
+}
+
+// The pages in view when the PDF opens, drawn by Windows' own PDF engine (Windows.Data.Pdf): ready
+// about 0.1 s after the launch, in time for the window's first appearance, where the browser engine
+// and pdf.js show them at 0.6 s. They render on their own thread, from the very start; the window
+// says where they go once it exists, and only what's in view is rendered.
+class Preview : IDisposable {
+  const double Gap = 8; // between pages in continuous mode, as in index.html
+  readonly string file;
+  readonly ManualResetEvent placed = new ManualResetEvent(false);
+  Size client;           // the window's inside, device pixels
+  int dpi;
+  string fit, mode;      // the page's view settings: "width" or "page", "continuous" or "single"
+  Action<Preview> done;  // called on the preview's thread once it's ready, or has failed
+
+  public readonly List<Bitmap> Images = new List<Bitmap>();       // the pages in view, or the parts in view
+  public readonly List<Rectangle> Spots = new List<Rectangle>();  // where each goes in the window
+  public volatile bool Finished;
+
+  public static Preview Start(string file) {
+    Preview p = new Preview(file);
+    Thread t = new Thread(p.Work); // MTA: Windows' engine is called from here, waiting on its results
+    t.IsBackground = true;
+    t.Start();
+    return p;
+  }
+
+  Preview(string file) { this.file = file; }
+
+  // From the window, once it exists. view: "fit,mode" as the page last reported it.
+  public void Place(Size client, int dpi, string view, Action<Preview> done) {
+    string[] v = view.Split(',');
+    this.client = client;
+    this.dpi = dpi;
+    fit = v[0];
+    mode = v[1];
+    this.done = done;
+    placed.Set();
+  }
+
+  void Work() {
+    try {
+      Render();
+    } catch {
+      // A password, a broken file: the window shows the name, and the page says what's wrong.
+      foreach (Bitmap b in Images) b.Dispose();
+      Images.Clear();
+      Spots.Clear();
+    }
+    Finished = true;
+    if (placed.WaitOne(0) && done != null) done(this);
+  }
+
+  // Kept apart, so Windows' engine is loaded only on this thread.
+  // The engine draws through a Direct3D device of this app's own: a software one (WARP), ready in
+  // 15 ms, where the graphics card takes 160 ms to start.
+  [MethodImpl(MethodImplOptions.NoInlining)]
+  void Render() {
+    Windows.Data.Pdf.PdfDocument doc = Wait(Windows.Data.Pdf.PdfDocument.LoadFromFileAsync(
+      Wait(Windows.Storage.StorageFile.GetFileFromPathAsync(file))));
+    IntPtr device = IntPtr.Zero, context = IntPtr.Zero, dxgi = IntPtr.Zero, renderer = IntPtr.Zero;
+    try {
+      int level;
+      Check(D3D11CreateDevice(IntPtr.Zero, D3D_DRIVER_TYPE_WARP, IntPtr.Zero, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        IntPtr.Zero, 0, D3D11_SDK_VERSION, out device, out level, out context));
+      Guid iid = IID_IDXGIDevice;
+      Check(Marshal.QueryInterface(device, ref iid, out dxgi));
+      Check(PdfCreateRenderer(dxgi, out renderer));
+      placed.WaitOne();
+
+      // The pages from the top of the document, laid out as layout() in index.html does: as wide as
+      // the view ("width") or fitting in it ("page"), centred across; one below the other, or the
+      // first one alone, centred down too ("single"). In CSS pixels, which the page counts in.
+      double dpr = dpi / 96.0;
+      double viewW = Math.Round(client.Width / dpr), viewH = Math.Round(client.Height / dpr);
+      double top = 0;
+      Rectangle window = new Rectangle(Point.Empty, client);
+      for (uint i = 0; i < doc.PageCount; i++) {
+        using (Windows.Data.Pdf.PdfPage page = doc.GetPage(i)) {
+          Windows.Foundation.Size dips = page.Size; // 1/96 in, rotation applied
+          double w = dips.Width * 0.75, h = dips.Height * 0.75; // points, as pdf.js measures pages
+          double s = fit == "page" ? Math.Min(viewW / w, viewH / h) : viewW / w;
+          double pageW = Math.Floor(w * s), pageH = Math.Floor(h * s);
+          double x = Math.Max(0, (viewW - pageW) / 2);
+          double y = mode == "single" ? Math.Max(0, (viewH - pageH) / 2) : top;
+          Rectangle rect = new Rectangle((int)Math.Round(x * dpr), (int)Math.Round(y * dpr),
+            (int)Math.Round(pageW * dpr), (int)Math.Round(pageH * dpr));
+          Rectangle visible = Rectangle.Intersect(rect, window);
+          if (visible.Width <= 0 || visible.Height <= 0) break;
+          Images.Add(RenderPart(page, dips.Width / rect.Width, rect, visible, device, context, renderer));
+          Spots.Add(visible);
+          if (mode == "single") break;
+          top = y + pageH + Gap;
+        }
+      }
+    } finally {
+      foreach (IntPtr com in new IntPtr[] { renderer, dxgi, context, device }) {
+        if (com != IntPtr.Zero) Marshal.Release(com);
+      }
+      Marshal.FinalReleaseComObject(doc); // lets go of the file now, not whenever the garbage is collected
+    }
+  }
+
+  // The visible part of a page placed at rect, at the window's resolution; k: page units per pixel.
+  static Bitmap RenderPart(Windows.Data.Pdf.PdfPage page, double k, Rectangle rect, Rectangle visible,
+      IntPtr device, IntPtr context, IntPtr renderer) {
+    IntPtr target = IntPtr.Zero, staging = IntPtr.Zero, surface = IntPtr.Zero, unknown = IntPtr.Zero;
+    try {
+      TextureDesc desc = new TextureDesc {
+        Width = (uint)visible.Width, Height = (uint)visible.Height, MipLevels = 1, ArraySize = 1,
+        Format = DXGI_FORMAT_B8G8R8A8_UNORM, SampleCount = 1, BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE
+      };
+      Check(Slot<CreateTexture2D>(device, 5)(device, ref desc, IntPtr.Zero, out target));
+      desc.Usage = D3D11_USAGE_STAGING; // a copy the CPU can read
+      desc.BindFlags = 0;
+      desc.CpuAccessFlags = D3D11_CPU_ACCESS_READ;
+      Check(Slot<CreateTexture2D>(device, 5)(device, ref desc, IntPtr.Zero, out staging));
+      Guid iid = IID_IDXGISurface;
+      Check(Marshal.QueryInterface(target, ref iid, out surface));
+
+      RenderParams p = new RenderParams {
+        Left = (float)((visible.Left - rect.X) * k), Top = (float)((visible.Top - rect.Y) * k),
+        Right = (float)((visible.Right - rect.X) * k), Bottom = (float)((visible.Bottom - rect.Y) * k),
+        Width = (uint)visible.Width, Height = (uint)visible.Height,
+        R = 1, G = 1, B = 1, A = 1, IgnoreHighContrast = 1 // true colours, as pdf.js shows them
+      };
+      unknown = Marshal.GetIUnknownForObject(page);
+      Check(Slot<RenderPageToSurface>(renderer, 3)(renderer, unknown, surface, new POINT(), ref p));
+
+      Slot<CopyResource>(context, 47)(context, staging, target);
+      Mapped m;
+      Check(Slot<Map>(context, 14)(context, staging, 0, D3D11_MAP_READ, 0, out m));
+      Bitmap image = new Bitmap(visible.Width, visible.Height, PixelFormat.Format32bppPArgb); // the same bytes, BGRA
+      BitmapData bits = image.LockBits(new Rectangle(Point.Empty, image.Size), ImageLockMode.WriteOnly, image.PixelFormat);
+      for (int y = 0; y < visible.Height; y++) {
+        CopyMemory(bits.Scan0 + y * bits.Stride, m.Data + y * (int)m.RowPitch, (UIntPtr)(uint)(visible.Width * 4));
+      }
+      image.UnlockBits(bits);
+      Slot<Unmap>(context, 15)(context, staging, 0);
+      return image;
+    } finally {
+      foreach (IntPtr com in new IntPtr[] { unknown, surface, staging, target }) {
+        if (com != IntPtr.Zero) Marshal.Release(com);
+      }
+    }
+  }
+
+  static T Wait<T>(Windows.Foundation.IAsyncOperation<T> op) {
+    using (ManualResetEvent ready = new ManualResetEvent(false)) {
+      op.Completed = delegate { ready.Set(); };
+      ready.WaitOne();
+    }
+    return op.GetResults();
+  }
+
+  static void Check(int hr) {
+    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+  }
+
+  // A method of a COM object, by its place in the object's table of methods (from the Windows SDK headers).
+  static T Slot<T>(IntPtr obj, int index) where T : class {
+    IntPtr method = Marshal.ReadIntPtr(Marshal.ReadIntPtr(obj), index * IntPtr.Size);
+    return (T)(object)Marshal.GetDelegateForFunctionPointer(method, typeof(T));
+  }
+
+  public void Dispose() {
+    foreach (Bitmap b in Images) b.Dispose();
+    Images.Clear();
+  }
+
+  public static int DpiOf(Control c) {
+    try { return (int)GetDpiForWindow(c.Handle); } catch { return 96; }
+  }
+
+  // ---- Direct3D 11 and Windows.Data.Pdf's native interface (d3d11.h, windows.data.pdf.interop.h) ----
+
+  const int D3D_DRIVER_TYPE_WARP = 5, D3D11_SDK_VERSION = 7, D3D11_MAP_READ = 1;
+  const uint D3D11_CREATE_DEVICE_BGRA_SUPPORT = 0x20, DXGI_FORMAT_B8G8R8A8_UNORM = 87, D3D11_USAGE_STAGING = 3;
+  const uint D3D11_BIND_SHADER_RESOURCE = 0x8, D3D11_BIND_RENDER_TARGET = 0x20, D3D11_CPU_ACCESS_READ = 0x20000;
+  static readonly Guid IID_IDXGIDevice = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
+  static readonly Guid IID_IDXGISurface = new Guid("cafcb56c-6ac3-4889-bf47-9e23bbd260ec");
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct TextureDesc {
+    public uint Width, Height, MipLevels, ArraySize, Format, SampleCount, SampleQuality, Usage, BindFlags, CpuAccessFlags, MiscFlags;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct Mapped { public IntPtr Data; public uint RowPitch, DepthPitch; }
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct POINT { public int X, Y; }
+
+  [StructLayout(LayoutKind.Sequential)]
+  struct RenderParams {                    // PDF_RENDER_PARAMS
+    public float Left, Top, Right, Bottom; // the part of the page, in its own units (1/96 in)
+    public uint Width, Height;             // the image's size
+    public float R, G, B, A;               // background
+    public byte IgnoreHighContrast;
+  }
+
+  // ID3D11Device method 5, IPdfRendererNative method 3, ID3D11DeviceContext methods 47, 14 and 15.
+  [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+  delegate int CreateTexture2D(IntPtr self, ref TextureDesc desc, IntPtr initialData, out IntPtr texture);
+  [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+  delegate int RenderPageToSurface(IntPtr self, IntPtr page, IntPtr surface, POINT offset, ref RenderParams p);
+  [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+  delegate void CopyResource(IntPtr self, IntPtr destination, IntPtr source);
+  [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+  delegate int Map(IntPtr self, IntPtr resource, uint subresource, int type, uint flags, out Mapped mapped);
+  [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+  delegate void Unmap(IntPtr self, IntPtr resource, uint subresource);
+
+  [DllImport("d3d11.dll")]
+  static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags,
+    IntPtr featureLevels, uint featureLevelCount, uint sdkVersion, out IntPtr device, out int featureLevel, out IntPtr context);
+  [DllImport("Windows.Data.Pdf.dll")] static extern int PdfCreateRenderer(IntPtr dxgiDevice, out IntPtr renderer);
+  [DllImport("kernel32.dll", EntryPoint = "RtlMoveMemory")] static extern void CopyMemory(IntPtr to, IntPtr from, UIntPtr count);
+  [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr hWnd);
 }
 
 // Window position and "always on top", remembered between runs.
@@ -87,21 +342,45 @@ static class Settings {
       File.WriteAllText(FilePath, string.Join(",", b.X, b.Y, b.Width, b.Height, onTop ? 1 : 0));
     } catch { }
   }
+
+  // The page's view settings, "fit,mode", which the page keeps and reports: the window needs them
+  // before the page exists, to place its preview of the first pages where the page will show them.
+  static string ViewPath { get { return Path.Combine(Program.DataDir, "view.txt"); } }
+  const string DefaultView = "width,continuous";
+
+  public static string LoadView() {
+    try { return ValidView(File.ReadAllText(ViewPath).Trim()) ?? DefaultView; } catch { return DefaultView; }
+  }
+
+  public static void SaveView(string view) {
+    if (ValidView(view) == null || view == LoadView()) return;
+    try {
+      Directory.CreateDirectory(Program.DataDir);
+      File.WriteAllText(ViewPath, view);
+    } catch { }
+  }
+
+  static string ValidView(string view) {
+    string[] v = view.Split(',');
+    return v.Length == 2 && (v[0] == "width" || v[0] == "page") && (v[1] == "continuous" || v[1] == "single") ? view : null;
+  }
 }
 
 class ViewerForm : Form {
-  readonly WebView2 web = new WebView2();
-  readonly Task<CoreWebView2Environment> engine;
+  WebView2 web;               // made with the window, under the cover
+  Cover cover;                // until the page shows the PDF
+  readonly Preview preview;   // the first pages, for the cover
+  bool shown, revealed;       // the window is shown, then uncloaked
   readonly string startFile;
   bool onTop;                 // always on top (not Form.TopMost: setting that activates the window)
   bool fullScreen;
   bool wasMaximized;
   Rectangle restoreBounds;    // where to go back to after full screen
 
-  public ViewerForm(string file, Task<CoreWebView2Environment> engine) {
+  public ViewerForm(string file, Preview preview) {
     startFile = file;
-    this.engine = engine;
-    Text = "PDF Viewer";
+    this.preview = preview;
+    Text = file == null ? "PDF Viewer" : Path.GetFileName(file) + " – PDF Viewer";
     FormBorderStyle = FormBorderStyle.None;
     StartPosition = FormStartPosition.Manual;
     BackColor = Color.FromArgb(0x1e, 0x1f, 0x22);
@@ -112,12 +391,24 @@ class ViewerForm : Form {
     Settings.Load(out saved, out onTop);
     Bounds = InitialBounds(saved);
 
-    web.DefaultBackgroundColor = BackColor;
-    web.Dock = DockStyle.Fill;
-    Controls.Add(web);
+    cover = new Cover(file == null ? "PDF Viewer" : Path.GetFileName(file));
+    cover.MouseDown += delegate { StartNonClientDrag(HTCAPTION); };
+    Controls.Add(cover);
 
-    Load += async delegate { await StartWebView(); };
-    Activated += delegate { web.Focus(); };
+    Load += async delegate { await StartWebView(); }; // just before the window shows
+    Shown += delegate {
+      shown = true;
+      if (preview == null || preview.Finished) {
+        Reveal();
+        return;
+      }
+      // The pages are due any moment: the window waits a little for them, so as to appear with them
+      // in it rather than flash the name first. A slow page is shown when it comes, over the name.
+      Timer wait = new Timer { Interval = PreviewWaitMs };
+      wait.Tick += delegate { wait.Dispose(); Reveal(); };
+      wait.Start();
+    };
+    Activated += delegate { if (web != null) web.Focus(); };
     FormClosing += delegate {
       Rectangle b = fullScreen ? restoreBounds : WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
       Settings.Save(b, onTop);
@@ -126,10 +417,53 @@ class ViewerForm : Form {
 
   protected override void OnHandleCreated(EventArgs e) {
     base.OnHandleCreated(e);
+    // Hidden from view until painted: a new window otherwise flashes white for a frame.
+    SetCloak(true);
     // Windows 11 leaves a window without a title bar square and shadowless unless asked.
     SetCorners(true);
     MARGINS m = new MARGINS { Left = 1, Right = 1, Top = 1, Bottom = 1 };
     DwmExtendFrameIntoClientArea(Handle, ref m);
+    // Now the window's screen is known, so is where the pages go. All of the window is its inside
+    // (see WM_NCCALCSIZE), though ClientSize doesn't know it yet.
+    if (preview != null && !RecreatingHandle) preview.Place(Size, Preview.DpiOf(this), Settings.LoadView(), PreviewReady);
+  }
+
+  const int PreviewWaitMs = 100;
+
+  // On the preview's thread.
+  void PreviewReady(Preview p) {
+    try {
+      BeginInvoke((Action)delegate {
+        if (cover != null && p.Images.Count > 0) {
+          cover.ShowPreview(p);
+          if (revealed) cover.Update();
+        }
+        if (shown) Reveal();
+      });
+    } catch { } // the window is already gone
+  }
+
+  // Uncloak the window, once it shows what it should.
+  void Reveal() {
+    if (revealed) return;
+    revealed = true;
+    if (cover != null) cover.Update(); // painted before the window is uncloaked
+    else Update();
+    DwmFlush(); // and on screen: uncloaked straight away, its first frame would still be white
+    SetCloak(false);
+  }
+
+  void SetCloak(bool on) {
+    int cloak = on ? 1 : 0;
+    DwmSetWindowAttribute(Handle, DWMWA_CLOAK, ref cloak, sizeof(int));
+  }
+
+  // The page says when the PDF is on screen; or it couldn't open it, and has something to say.
+  void Uncover() {
+    if (cover == null) return;
+    Controls.Remove(cover);
+    cover.Dispose();
+    cover = null;
   }
 
   void SetCorners(bool round) {
@@ -193,9 +527,17 @@ class ViewerForm : Form {
 
   // ---- WebView2 ----
 
+  // Kept apart, so the engine's libraries load only here, once the window and its cover exist.
   async Task StartWebView() {
+    web = new WebView2();
+    web.DefaultBackgroundColor = BackColor;
+    web.Dock = DockStyle.Fill;
+    Controls.Add(web); // under the cover
     try {
-      CoreWebView2Environment env = await engine;
+      CoreWebView2Environment.SetLoaderDllFolderPath(Program.AppDir);
+      CoreWebView2EnvironmentOptions options = new CoreWebView2EnvironmentOptions();
+      options.EnableTrackingPrevention = false; // only the app's own page is ever shown: nothing to track
+      CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Program.DataDir, "WebView2"), options);
       await web.EnsureCoreWebView2Async(env);
     } catch (Exception e) {
       MessageBox.Show("PDF Viewer needs the Microsoft Edge WebView2 Runtime, which comes with Windows 11.\n\n" + e.Message,
@@ -234,6 +576,10 @@ class ViewerForm : Form {
       core.NavigationCompleted -= ready;
       SendState();
       if (ActiveForm == this) web.Focus();
+      // Should the page never say it shows the PDF, the cover still goes.
+      Timer fallback = new Timer { Interval = 3000 };
+      fallback.Tick += delegate { fallback.Dispose(); Uncover(); };
+      fallback.Start();
     };
     core.NavigationCompleted += ready;
     // The PDF's name goes in the address, so the page starts loading it straight away.
@@ -277,6 +623,8 @@ class ViewerForm : Form {
       case "topmost": action = delegate { SetAlwaysOnTop(!onTop); }; break;
       case "minimize": action = delegate { WindowState = FormWindowState.Minimized; }; break;
       case "close": action = Close; break;
+      case "uncover": action = Uncover; break;
+      case "view": action = delegate { Settings.SaveView(arg); }; break;
     }
     // Run after the WebView2 event returns: moving and resizing start a modal loop.
     if (action != null) BeginInvoke(action);
@@ -290,7 +638,7 @@ class ViewerForm : Form {
   }
 
   void Post(string json) {
-    if (web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(json);
+    if (web != null && web.CoreWebView2 != null) web.CoreWebView2.PostWebMessageAsJson(json);
   }
 
   static string Json(string s) {
@@ -425,7 +773,7 @@ class ViewerForm : Form {
   const int WS_EX_TOPMOST = 0x00000008;
   const uint SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
   static readonly IntPtr HWND_TOPMOST = new IntPtr(-1), HWND_NOTOPMOST = new IntPtr(-2);
-  const int DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_DONOTROUND = 1, DWMWCP_ROUND = 2;
+  const int DWMWA_CLOAK = 13, DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_DONOTROUND = 1, DWMWCP_ROUND = 2;
   const int STARTF_USESHOWWINDOW = 0x1;
   const short SW_SHOWMINNOACTIVE = 7, SW_SHOWNA = 8, SW_SHOWNOACTIVATE = 4;
 
@@ -457,4 +805,5 @@ class ViewerForm : Form {
   [DllImport("kernel32.dll", EntryPoint = "GetStartupInfoW")] static extern void GetStartupInfo(out STARTUPINFO info);
   [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hWnd, int attribute, ref int value, int size);
   [DllImport("dwmapi.dll")] static extern int DwmExtendFrameIntoClientArea(IntPtr hWnd, ref MARGINS margins);
+  [DllImport("dwmapi.dll")] static extern int DwmFlush();
 }

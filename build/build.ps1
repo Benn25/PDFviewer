@@ -59,11 +59,16 @@ Set-Content -LiteralPath $versionFile -Encoding UTF8 -Value @(
   "[assembly: System.Reflection.AssemblyInformationalVersion(""$version"")]"
 )
 
-# The exe, with the .NET Framework compiler every Windows 10/11 has.
-$csc = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+# The exe, with the .NET Framework compiler every Windows 10/11 has. Windows' own PDF engine, which
+# draws the first page while the browser engine starts, is described by the system's .winmd files.
+$framework = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319'
+$csc = Join-Path $framework 'csc.exe'
+$winmd = Join-Path $env:SystemRoot 'System32\WinMetadata'
+$winrt = 'Data', 'Foundation', 'Storage' | ForEach-Object { "/reference:$winmd\Windows.$_.winmd" }
 & $csc /nologo /target:winexe /platform:x64 /optimize+ `
   "/win32icon:$icon" "/win32manifest:$root\host\app.manifest" `
   /reference:System.Windows.Forms.dll /reference:System.Drawing.dll "/reference:$core" "/reference:$winforms" `
+  $winrt "/reference:$framework\System.Runtime.dll" "/reference:$framework\System.Runtime.WindowsRuntime.dll" `
   "/out:$out\PDF Viewer.exe" "$root\host\PDFViewer.cs" $versionFile
 if ($LASTEXITCODE -ne 0) { throw 'Compiling host\PDFViewer.cs failed.' }
 

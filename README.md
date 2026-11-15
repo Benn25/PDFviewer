@@ -6,7 +6,9 @@ window with the page in it, and everything else in the right-click menu.
 - **Instant page changes.** Pages are drawn from a cache, never waiting for the renderer: a thumbnail of
   every page is ready shortly after opening, and the next pages are pre-rendered at full resolution.
   One page per wheel notch, never skipping a page, however fast the wheel spins.
-- **Opens in about half a second**, from double-click to the page sharp on screen.
+- **Opens at once**: the page is on screen about 0.2 s after the double-click. Windows' own PDF engine
+  draws it while the viewer starts, and the viewer takes over unseen half a second later.
+- **Prints** with Ctrl+P, through the usual Windows print dialog (printer, pages, copies, Save as PDF).
 - **Zoom** with Ctrl+wheel or Ctrl+middle-drag, sharp at any level: zoomed far in, only the part in
   view is rendered at full resolution.
 - **Full-screen page mode**, fit width / fit page, single page / continuous, always on top.
@@ -41,11 +43,12 @@ The app isn't signed, so on first launch Windows may show "Windows protected you
 | Ctrl+wheel, Ctrl+middle-drag | zoom around the mouse (drag up: in, down: out) |
 | Middle-drag | move the page around |
 | Ctrl+plus / Ctrl+minus / Ctrl+0 | zoom in / out / back to the fit |
-| F, Ctrl+P or double-click | full-screen page mode, and back (Esc leaves too) |
+| F, Ctrl+L or double-click | full-screen page mode, and back (Esc leaves too) |
 | Z | fit width ⇄ fit page |
 | C | continuous ⇄ single page |
 | T | always on top |
 | Ctrl+O | open a PDF (or drop one on the window) |
+| Ctrl+P | print |
 | Ctrl+W | close |
 
 ## Build
@@ -77,7 +80,9 @@ into dots) on the Releases page (`.github/workflows/release.yml`). The tag has t
 - `index.html`: the whole viewer, on [pdf.js](https://github.com/mozilla/pdf.js). It also works on its
   own in a browser.
 - `host/PDFViewer.cs`: the window around it: WinForms and WebView2, with a real but invisible frame
-  (shadow, rounded corners, snapping) and no title bar.
+  (shadow, rounded corners, snapping) and no title bar. Until the page is ready, it shows the first
+  pages itself, drawn by Windows.Data.Pdf on a software Direct3D device (WARP), which starts in a
+  fraction of the time the graphics card takes.
 - `windows/`: the Add / Remove from Windows scripts and the read-me files shipped in the zip.
 - `build/`: `build.ps1` and `make-icon.ps1`, which draws the icon.
 
